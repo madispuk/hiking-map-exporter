@@ -1,0 +1,158 @@
+"""
+MapAnt High-Resolution Export Tool
+
+Flask backend that serves the map interface and handles high-resolution
+export requests by fetching and stitching WMS tiles.
+"""
+
+import io
+import math
+from flask import Flask, request, send_file, jsonify
+from PIL import Image
+import requests
+
+app = Flask(__name__, static_folder='static', static_url_path='')
+
+# WMS Configuration
+WMS_URL = "https://mapantee.gokartor.se/ogc/wms.php"
+WMS_LAYER = "mapantee"
+WMS_CRS = "EPSG:3301"
+MAX_TILE_SIZE = 4000  # Max pixels per WMS request
+
+# A3 at 300 DPI
+A3_LANDSCAPE = (4961, 3508)
+A3_PORTRAIT = (3508, 4961)
+
+
+@app.route('/')
+def index():
+    return app.send_static_file('index.html')
+
+
+@app.route('/api/export', methods=['POST'])
+def export_map():
+    """
+    Export a high-resolution map image.
+
+    Expected JSON body:
+    {
+        "bbox": {"minx": float, "miny": float, "maxx": float, "maxy": float},
+        "orientation": "landscape" | "portrait"
+    }
+    """
+    data = request.get_json()
+
+    if not data:
+        return jsonify({"error": "No JSON data provided"}), 400
+
+    bbox = data.get('bbox')
+    orientation = data.get('orientation', 'landscape')
+
+    if not bbox:
+        return jsonify({"error": "Missing bbox parameter"}), 400
+
+    try:
+        minx = float(bbox['minx'])
+        miny = float(bbox['miny'])
+        maxx = float(bbox['maxx'])
+        maxy = float(bbox['maxy'])
+    except (KeyError, ValueError, TypeError) as e:
+        return jsonify({"error": f"Invalid bbox format: {e}"}), 400
+
+    # Determine output dimensions
+    if orientation == 'portrait':
+        output_width, output_height = A3_PORTRAIT
+    else:
+        output_width, output_height = A3_LANDSCAPE
+
+    # Calculate tile grid
+    tiles_x = math.ceil(output_width / MAX_TILE_SIZE)
+    tiles_y = math.ceil(output_height / MAX_TILE_SIZE)
+
+    # Calculate geographic extent
+    geo_width = maxx - minx
+    geo_height = maxy - miny
+
+    # Create output image
+    final_image = Image.new('RGB', (output_width, output_height), (255, 255, 255))
+
+    # Fetch and stitch tiles
+    for ty in range(tiles_y):
+        for tx in range(tiles_x):
+            # Calculate pixel bounds for this tile
+            px_left = tx * MAX_TILE_SIZE
+            px_top = ty * MAX_TILE_SIZE
+            px_right = min((tx + 1) * MAX_TILE_SIZE, output_width)
+            px_bottom = min((ty + 1) * MAX_TILE_SIZE, output_height)
+
+            tile_width = px_right - px_left
+            tile_height = px_bottom - px_top
+
+            # Calculate geographic bounds for this tile
+            # Note: pixel Y increases downward, but geo Y increases upward
+            tile_minx = minx + (px_left / output_width) * geo_width
+            tile_maxx = minx + (px_right / output_width) * geo_width
+            tile_maxy = maxy - (px_top / output_height) * geo_height
+            tile_miny = maxy - (px_bottom / output_height) * geo_height
+
+            # Fetch tile from WMS
+            tile_image = fetch_wms_tile(
+                tile_minx, tile_miny, tile_maxx, tile_maxy,
+                tile_width, tile_height
+            )
+
+            if tile_image:
+                final_image.paste(tile_image, (px_left, px_top))
+
+    # Save to buffer and return
+    buffer = io.BytesIO()
+    final_image.save(buffer, format='PNG', optimize=True)
+    buffer.seek(0)
+
+    filename = f"mapant_a3_{orientation}.png"
+
+    return send_file(
+        buffer,
+        mimetype='image/png',
+        as_attachment=True,
+        download_name=filename
+    )
+
+
+def fetch_wms_tile(minx, miny, maxx, maxy, width, height):
+    """Fetch a single tile from the WMS service."""
+    params = {
+        'SERVICE': 'WMS',
+        'VERSION': '1.3.0',
+        'REQUEST': 'GetMap',
+        'LAYERS': WMS_LAYER,
+        'CRS': WMS_CRS,
+        'BBOX': f"{minx},{miny},{maxx},{maxy}",
+        'WIDTH': width,
+        'HEIGHT': height,
+        'FORMAT': 'image/png',
+        'STYLES': ''
+    }
+
+    try:
+        response = requests.get(WMS_URL, params=params, timeout=60)
+        response.raise_for_status()
+
+        # Check if response is an image
+        content_type = response.headers.get('Content-Type', '')
+        if 'image' not in content_type:
+            print(f"WMS error: {response.text[:500]}")
+            return None
+
+        return Image.open(io.BytesIO(response.content))
+
+    except requests.RequestException as e:
+        print(f"Failed to fetch tile: {e}")
+        return None
+    except Exception as e:
+        print(f"Error processing tile: {e}")
+        return None
+
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
