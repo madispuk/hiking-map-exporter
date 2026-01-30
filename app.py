@@ -7,6 +7,7 @@ export requests by fetching and stitching WMS tiles.
 
 import io
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, send_file, jsonify
 from PIL import Image
 import requests
@@ -92,7 +93,8 @@ def export_map():
     # Create output image
     final_image = Image.new('RGB', (output_width, output_height), (255, 255, 255))
 
-    # Fetch and stitch tiles
+    # Build list of tile specifications
+    tile_specs = []
     for ty in range(tiles_y):
         for tx in range(tiles_x):
             # Calculate pixel bounds for this tile
@@ -111,14 +113,30 @@ def export_map():
             tile_maxy = maxy - (px_top / output_height) * geo_height
             tile_miny = maxy - (px_bottom / output_height) * geo_height
 
-            # Fetch tile from WMS
-            tile_image = fetch_wms_tile(
-                tile_minx, tile_miny, tile_maxx, tile_maxy,
-                tile_width, tile_height, layer
-            )
+            tile_specs.append({
+                'minx': tile_minx, 'miny': tile_miny,
+                'maxx': tile_maxx, 'maxy': tile_maxy,
+                'width': tile_width, 'height': tile_height,
+                'px_left': px_left, 'px_top': px_top,
+                'layer': layer
+            })
 
+    # Fetch tiles concurrently
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_spec = {
+            executor.submit(
+                fetch_wms_tile,
+                spec['minx'], spec['miny'], spec['maxx'], spec['maxy'],
+                spec['width'], spec['height'], spec['layer']
+            ): spec
+            for spec in tile_specs
+        }
+
+        for future in as_completed(future_to_spec):
+            spec = future_to_spec[future]
+            tile_image = future.result()
             if tile_image:
-                final_image.paste(tile_image, (px_left, px_top))
+                final_image.paste(tile_image, (spec['px_left'], spec['px_top']))
 
     # Save to buffer and return
     buffer = io.BytesIO()
