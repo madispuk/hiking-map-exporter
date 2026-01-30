@@ -9,7 +9,7 @@ import io
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, send_file, jsonify
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import requests
 
 app = Flask(__name__, static_folder='static', static_url_path='')
@@ -138,6 +138,10 @@ def export_map():
             if tile_image:
                 final_image.paste(tile_image, (spec['px_left'], spec['px_top']))
 
+    # Add scale bar
+    meters_per_pixel = geo_width / output_width
+    draw_scale_bar(final_image, meters_per_pixel)
+
     # Save to buffer and return
     buffer = io.BytesIO()
     final_image.save(buffer, format='PNG', optimize=True)
@@ -151,6 +155,94 @@ def export_map():
         as_attachment=True,
         download_name=filename
     )
+
+
+def draw_scale_bar(image, meters_per_pixel):
+    """Draw a scale bar on the bottom right of the image."""
+    # Scale bar distances to choose from (in meters)
+    scale_options = [100, 200, 500, 1000, 2000, 5000, 10000]
+
+    # Target scale bar width: ~15% of image width
+    target_width_px = image.width * 0.15
+
+    # Find the best scale distance
+    best_distance = scale_options[0]
+    for distance in scale_options:
+        bar_width_px = distance / meters_per_pixel
+        if bar_width_px <= target_width_px * 1.5:
+            best_distance = distance
+
+    bar_width_px = int(best_distance / meters_per_pixel)
+
+    # Format label
+    if best_distance >= 1000:
+        label = f"{best_distance // 1000} km"
+    else:
+        label = f"{best_distance} m"
+
+    # Position (bottom right with margin)
+    margin = 40
+    bar_height = 12
+    x_right = image.width - margin
+    x_left = x_right - bar_width_px
+    y_bottom = image.height - margin
+    y_top = y_bottom - bar_height
+
+    draw = ImageDraw.Draw(image)
+
+    # Try to load a font, fall back to default
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+    except (IOError, OSError):
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 28)
+        except (IOError, OSError):
+            font = ImageFont.load_default()
+
+    # Get text size
+    text_bbox = draw.textbbox((0, 0), label, font=font)
+    text_width = text_bbox[2] - text_bbox[0]
+    text_height = text_bbox[3] - text_bbox[1]
+
+    # Draw semi-transparent background
+    bg_padding = 15
+    bg_left = x_left - bg_padding
+    bg_top = y_top - text_height - bg_padding * 2
+    bg_right = x_right + bg_padding
+    bg_bottom = y_bottom + bg_padding
+
+    # Create overlay for semi-transparent background
+    overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    overlay_draw.rounded_rectangle(
+        [bg_left, bg_top, bg_right, bg_bottom],
+        radius=8,
+        fill=(255, 255, 255, 200)
+    )
+    image.paste(Image.alpha_composite(image.convert('RGBA'), overlay).convert('RGB'))
+
+    # Redraw on the composited image
+    draw = ImageDraw.Draw(image)
+
+    # Draw scale bar (black with white outline for visibility)
+    # White outline
+    draw.rectangle([x_left-2, y_top-2, x_right+2, y_bottom+2], fill=(255, 255, 255))
+    # Black bar
+    draw.rectangle([x_left, y_top, x_right, y_bottom], fill=(0, 0, 0))
+
+    # Draw end ticks
+    tick_height = 8
+    draw.rectangle([x_left, y_top - tick_height, x_left + 3, y_bottom], fill=(0, 0, 0))
+    draw.rectangle([x_right - 3, y_top - tick_height, x_right, y_bottom], fill=(0, 0, 0))
+
+    # Draw middle tick
+    mid_x = (x_left + x_right) // 2
+    draw.rectangle([mid_x - 1, y_top - tick_height // 2, mid_x + 2, y_bottom], fill=(0, 0, 0))
+
+    # Draw label centered above bar
+    text_x = x_left + (bar_width_px - text_width) // 2
+    text_y = y_top - text_height - 10
+    draw.text((text_x, text_y), label, fill=(0, 0, 0), font=font)
 
 
 def fetch_wms_tile(minx, miny, maxx, maxy, width, height, layer='mapant'):
