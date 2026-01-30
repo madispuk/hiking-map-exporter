@@ -1,204 +1,221 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MapAnt Export Tool</title>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hiking Map Exporter - Estonia</title>
 
     <!-- Leaflet CSS -->
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    />
 
     <style>
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
 
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-        }
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
 
-        .toolbar {
-            background: #2c3e50;
-            color: white;
-            padding: 12px 20px;
-            display: flex;
-            align-items: center;
-            gap: 20px;
-            flex-wrap: wrap;
-        }
+      .toolbar {
+        background: #2c3e50;
+        color: white;
+        padding: 12px 20px;
+        display: flex;
+        align-items: center;
+        gap: 20px;
+        flex-wrap: wrap;
+      }
 
-        .toolbar h1 {
-            font-size: 18px;
-            font-weight: 500;
-            margin-right: auto;
-        }
+      .toolbar h1 {
+        font-size: 18px;
+        font-weight: 500;
+        margin-right: auto;
+      }
 
-        .toolbar-group {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
+      .toolbar-group {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
 
-        .toolbar label {
-            font-size: 14px;
-        }
+      .toolbar label {
+        font-size: 14px;
+      }
 
-        .toolbar select, .toolbar button {
-            padding: 8px 16px;
-            border: none;
-            border-radius: 4px;
-            font-size: 14px;
-            cursor: pointer;
-        }
+      .toolbar select,
+      .toolbar button {
+        padding: 8px 16px;
+        border: none;
+        border-radius: 4px;
+        font-size: 14px;
+        cursor: pointer;
+      }
 
-        .toolbar select {
-            background: white;
-            color: #333;
-        }
+      .toolbar select {
+        background: white;
+        color: #333;
+      }
 
-        .toolbar button {
-            background: #3498db;
-            color: white;
-            transition: background 0.2s;
-        }
+      .toolbar button {
+        background: #3498db;
+        color: white;
+        transition: background 0.2s;
+      }
 
-        .toolbar button:hover {
-            background: #2980b9;
-        }
+      .toolbar button:hover {
+        background: #2980b9;
+      }
 
-        .toolbar button:disabled {
-            background: #7f8c8d;
-            cursor: not-allowed;
-        }
+      .toolbar button:disabled {
+        background: #7f8c8d;
+        cursor: not-allowed;
+      }
 
-        .toolbar button.active {
-            background: #27ae60;
-        }
+      .toolbar button.active {
+        background: #27ae60;
+      }
 
-        .toolbar button.export-btn {
-            background: #e74c3c;
-        }
+      .toolbar button.export-btn {
+        background: #e74c3c;
+      }
 
-        .toolbar button.export-btn:hover {
-            background: #c0392b;
-        }
+      .toolbar button.export-btn:hover {
+        background: #c0392b;
+      }
 
-        .toolbar button.export-btn:disabled {
-            background: #7f8c8d;
-        }
+      .toolbar button.export-btn:disabled {
+        background: #7f8c8d;
+      }
 
-        #map {
-            flex: 1;
-            width: 100%;
-        }
+      #map {
+        flex: 1;
+        width: 100%;
+      }
 
-        .info-panel {
-            position: absolute;
-            bottom: 20px;
-            left: 20px;
-            background: white;
-            padding: 12px 16px;
-            border-radius: 4px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-            z-index: 1000;
-            font-size: 13px;
-            max-width: 300px;
-        }
+      .info-panel {
+        position: absolute;
+        bottom: 20px;
+        left: 20px;
+        background: white;
+        padding: 12px 16px;
+        border-radius: 4px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+        z-index: 1000;
+        font-size: 13px;
+        max-width: 300px;
+      }
 
-        .info-panel p {
-            margin: 4px 0;
-        }
+      .info-panel p {
+        margin: 4px 0;
+      }
 
-        .info-panel .coords {
-            font-family: monospace;
-            font-size: 12px;
-            color: #666;
-        }
+      .info-panel .coords {
+        font-family: monospace;
+        font-size: 12px;
+        color: #666;
+      }
 
-        .loading-overlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0,0,0,0.7);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            z-index: 2000;
-            color: white;
-        }
+      .loading-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.7);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        z-index: 2000;
+        color: white;
+      }
 
-        .loading-overlay.hidden {
-            display: none;
-        }
+      .loading-overlay.hidden {
+        display: none;
+      }
 
-        .spinner {
-            width: 50px;
-            height: 50px;
-            border: 4px solid rgba(255,255,255,0.3);
-            border-top-color: white;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-        }
+      .spinner {
+        width: 50px;
+        height: 50px;
+        border: 4px solid rgba(255, 255, 255, 0.3);
+        border-top-color: white;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+      }
 
-        @keyframes spin {
-            to { transform: rotate(360deg); }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
         }
+      }
 
-        .loading-overlay p {
-            margin-top: 16px;
-            font-size: 16px;
-        }
+      .loading-overlay p {
+        margin-top: 16px;
+        font-size: 16px;
+      }
 
-        .attribution {
-            font-size: 11px;
-            color: #95a5a6;
-            margin-left: 20px;
-        }
+      .attribution {
+        font-size: 11px;
+        color: #95a5a6;
+        margin-left: 20px;
+      }
     </style>
-</head>
-<body>
+  </head>
+  <body>
     <div class="toolbar">
-        <h1>MapAnt Export Tool</h1>
+      <h1>Hiking Map Exporter - Estonia</h1>
 
-        <div class="toolbar-group">
-            <label for="orientation">Orientation:</label>
-            <select id="orientation">
-                <option value="landscape">Landscape (4961x3508)</option>
-                <option value="portrait">Portrait (3508x4961)</option>
-            </select>
-        </div>
+      <div class="toolbar-group">
+        <label for="orientation">Orientation:</label>
+        <select id="orientation">
+          <option value="landscape">Landscape (4961x3508)</option>
+          <option value="portrait">Portrait (3508x4961)</option>
+        </select>
+      </div>
 
-        <div class="toolbar-group">
-            <button id="draw-btn">Draw Rectangle</button>
-            <button id="clear-btn" disabled>Clear</button>
-            <button id="export-btn" class="export-btn" disabled>Export PNG</button>
-        </div>
+      <div class="toolbar-group">
+        <label for="layer-select">Layer:</label>
+        <select id="layer-select">
+          <option value="mapant">MapAnt</option>
+          <option value="ortho">Orthophoto</option>
+        </select>
+      </div>
 
-        <span class="attribution">Map data: MapAnt Estonia (CC BY 4.0)</span>
+      <div class="toolbar-group">
+        <button id="draw-btn">Draw Rectangle</button>
+        <button id="clear-btn" disabled>Clear</button>
+        <button id="export-btn" class="export-btn" disabled>Export PNG</button>
+      </div>
+
+      <span class="attribution" id="attribution"
+        >Map data: MapAnt Estonia (CC BY 4.0)</span
+      >
     </div>
 
     <div id="map"></div>
 
     <div class="info-panel" id="info-panel">
-        <p><strong>Instructions:</strong></p>
-        <p>1. Select orientation (landscape/portrait)</p>
-        <p>2. Click "Draw Rectangle" and drag on map</p>
-        <p>3. Click "Export PNG" to download</p>
-        <p id="selection-info" style="display: none;"></p>
+      <p><strong>Instructions:</strong></p>
+      <p>1. Select orientation (landscape/portrait)</p>
+      <p>2. Click "Draw Rectangle" and drag on map</p>
+      <p>3. Click "Export PNG" to download</p>
+      <p id="selection-info" style="display: none"></p>
     </div>
 
     <div class="loading-overlay hidden" id="loading">
-        <div class="spinner"></div>
-        <p>Generating high-resolution image...</p>
-        <p style="font-size: 13px; color: #bbb;">This may take a moment</p>
+      <div class="spinner"></div>
+      <p>Generating high-resolution image...</p>
+      <p style="font-size: 13px; color: #bbb">This may take a moment</p>
     </div>
 
     <!-- Proj4 and Leaflet -->
@@ -207,5 +224,5 @@
     <script src="https://unpkg.com/proj4leaflet@1.0.2/src/proj4leaflet.js"></script>
 
     <script src="app.js"></script>
-</body>
+  </body>
 </html>

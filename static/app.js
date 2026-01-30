@@ -40,6 +40,8 @@ const ESTONIA_BOUNDS = {
 // State
 let map;
 let wmsLayer;
+let orthoLayer;
+let currentLayer = 'mapant';
 let selectionRectangle = null;
 let isDrawing = false;
 let drawStartPoint = null;
@@ -50,8 +52,16 @@ const drawBtn = document.getElementById('draw-btn');
 const clearBtn = document.getElementById('clear-btn');
 const exportBtn = document.getElementById('export-btn');
 const orientationSelect = document.getElementById('orientation');
+const layerSelect = document.getElementById('layer-select');
 const loadingOverlay = document.getElementById('loading');
 const selectionInfo = document.getElementById('selection-info');
+const attributionText = document.getElementById('attribution');
+
+// Layer attributions
+const LAYER_ATTRIBUTIONS = {
+    'mapant': 'Map data: MapAnt Estonia (CC BY 4.0)',
+    'ortho': 'Map data: Maa-amet Orthophoto'
+};
 
 // Initialize map
 function initMap() {
@@ -70,7 +80,7 @@ function initMap() {
         maxZoom: 14
     });
 
-    // Add WMS layer
+    // Add MapAnt WMS layer
     wmsLayer = L.tileLayer.wms('https://mapantee.gokartor.se/ogc/wms.php', {
         layers: 'mapantee',
         format: 'image/png',
@@ -79,11 +89,49 @@ function initMap() {
         maxZoom: 14
     });
 
-    wmsLayer.addTo(map);
+    // Add Orthophoto layer (Maaamet WMS) - supports EPSG:3301
+    orthoLayer = L.tileLayer.wms('https://kaart.maaamet.ee/wms/fotokaart', {
+        layers: 'EESTIFOTO',
+        format: 'image/jpeg',
+        transparent: false,
+        attribution: 'Maa-amet',
+        maxZoom: 14
+    });
+
+    // Add layer based on current selection (handles browser form caching)
+    if (layerSelect.value === 'ortho') {
+        orthoLayer.addTo(map);
+        currentLayer = 'ortho';
+        attributionText.textContent = LAYER_ATTRIBUTIONS['ortho'];
+    } else {
+        wmsLayer.addTo(map);
+        currentLayer = 'mapant';
+    }
 
     // Setup event listeners
     setupDrawing();
     setupButtons();
+    setupLayerToggle();
+}
+
+// Setup layer toggle
+function setupLayerToggle() {
+    layerSelect.addEventListener('change', () => {
+        const selectedLayer = layerSelect.value;
+
+        if (selectedLayer === 'ortho' && currentLayer !== 'ortho') {
+            map.removeLayer(wmsLayer);
+            orthoLayer.addTo(map);
+            currentLayer = 'ortho';
+        } else if (selectedLayer === 'mapant' && currentLayer !== 'mapant') {
+            map.removeLayer(orthoLayer);
+            wmsLayer.addTo(map);
+            currentLayer = 'mapant';
+        }
+
+        // Update attribution text
+        attributionText.textContent = LAYER_ATTRIBUTIONS[selectedLayer];
+    });
 }
 
 // Setup rectangle drawing
@@ -175,6 +223,17 @@ function calculateA3Bounds(startLatLng, endLatLng) {
         height = width / ratio;
     } else {
         height = Math.abs(dy);
+        width = height * ratio;
+    }
+
+    // Cap max size to 20km for either dimension
+    const MAX_SIZE = 20000; // 20km in meters
+    if (width > MAX_SIZE) {
+        width = MAX_SIZE;
+        height = width / ratio;
+    }
+    if (height > MAX_SIZE) {
+        height = MAX_SIZE;
         width = height * ratio;
     }
 
@@ -316,6 +375,7 @@ async function exportMap() {
     }
 
     const orientation = orientationSelect.value;
+    const layer = layerSelect.value;
 
     // Convert bounds to EPSG:3301
     const sw = currentBounds.getSouthWest();
@@ -341,7 +401,7 @@ async function exportMap() {
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ bbox, orientation })
+            body: JSON.stringify({ bbox, orientation, layer })
         });
 
         if (!response.ok) {

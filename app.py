@@ -14,10 +14,22 @@ import requests
 app = Flask(__name__, static_folder='static', static_url_path='')
 
 # WMS Configuration
-WMS_URL = "https://mapantee.gokartor.se/ogc/wms.php"
-WMS_LAYER = "mapantee"
 WMS_CRS = "EPSG:3301"
 MAX_TILE_SIZE = 4000  # Max pixels per WMS request
+
+# Layer configurations
+LAYERS = {
+    'mapant': {
+        'url': 'https://mapantee.gokartor.se/ogc/wms.php',
+        'layer': 'mapantee',
+        'format': 'image/png'
+    },
+    'ortho': {
+        'url': 'https://kaart.maaamet.ee/wms/fotokaart',
+        'layer': 'EESTIFOTO',
+        'format': 'image/jpeg'
+    }
+}
 
 # A3 at 300 DPI
 A3_LANDSCAPE = (4961, 3508)
@@ -47,6 +59,10 @@ def export_map():
 
     bbox = data.get('bbox')
     orientation = data.get('orientation', 'landscape')
+    layer = data.get('layer', 'mapant')
+
+    if layer not in LAYERS:
+        layer = 'mapant'
 
     if not bbox:
         return jsonify({"error": "Missing bbox parameter"}), 400
@@ -98,7 +114,7 @@ def export_map():
             # Fetch tile from WMS
             tile_image = fetch_wms_tile(
                 tile_minx, tile_miny, tile_maxx, tile_maxy,
-                tile_width, tile_height
+                tile_width, tile_height, layer
             )
 
             if tile_image:
@@ -109,7 +125,7 @@ def export_map():
     final_image.save(buffer, format='PNG', optimize=True)
     buffer.seek(0)
 
-    filename = f"mapant_a3_{orientation}.png"
+    filename = f"{layer}_a3_{orientation}.png"
 
     return send_file(
         buffer,
@@ -119,23 +135,33 @@ def export_map():
     )
 
 
-def fetch_wms_tile(minx, miny, maxx, maxy, width, height):
+def fetch_wms_tile(minx, miny, maxx, maxy, width, height, layer='mapant'):
     """Fetch a single tile from the WMS service."""
+    layer_config = LAYERS.get(layer, LAYERS['mapant'])
+
+    # WMS 1.3.0 axis order depends on CRS
+    # Maaamet uses Y,X (Northing, Easting) for EPSG:3301
+    # MapAnt uses X,Y order
+    if layer == 'ortho':
+        bbox = f"{miny},{minx},{maxy},{maxx}"  # Y,X order for Maaamet
+    else:
+        bbox = f"{minx},{miny},{maxx},{maxy}"  # X,Y order for MapAnt
+
     params = {
         'SERVICE': 'WMS',
         'VERSION': '1.3.0',
         'REQUEST': 'GetMap',
-        'LAYERS': WMS_LAYER,
+        'LAYERS': layer_config['layer'],
         'CRS': WMS_CRS,
-        'BBOX': f"{minx},{miny},{maxx},{maxy}",
+        'BBOX': bbox,
         'WIDTH': width,
         'HEIGHT': height,
-        'FORMAT': 'image/png',
+        'FORMAT': layer_config['format'],
         'STYLES': ''
     }
 
     try:
-        response = requests.get(WMS_URL, params=params, timeout=60)
+        response = requests.get(layer_config['url'], params=params, timeout=60)
         response.raise_for_status()
 
         # Check if response is an image
