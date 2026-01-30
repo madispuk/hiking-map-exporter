@@ -1,0 +1,13 @@
+[project]
+name = "hiking-map-exporter"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "flask==3.1.2",
+    "pillow==12.1.0",
+    "requests==2.32.5",
+    "pyproj==3.7.2",
+    "gunicorn>=24.1.1",
+]
