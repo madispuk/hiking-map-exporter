@@ -42,10 +42,13 @@ let map;
 let wmsLayer;
 let orthoLayer;
 let currentLayer = 'mapant';
-let selectionRectangle = null;
+let selectionPolygon = null;
 let isDrawing = false;
 let drawStartPoint = null;
-let currentBounds = null;
+let currentBounds3301 = null; // Stored in EPSG:3301 {minX, minY, maxX, maxY}
+
+// Number of points per edge for grid-aligned polygon
+const POINTS_PER_EDGE = 20;
 
 // DOM Elements
 const drawBtn = document.getElementById('draw-btn');
@@ -62,6 +65,49 @@ const LAYER_ATTRIBUTIONS = {
     'mapant': 'Map data: MapAnt Estonia (CC BY 4.0)',
     'ortho': 'Map data: Maa-amet Orthophoto'
 };
+
+/**
+ * Create polygon points that follow EPSG:3301 grid lines exactly.
+ * This ensures the drawn polygon matches the exported image bounds.
+ */
+function createGridAlignedPolygon(bounds3301) {
+    const { minX, minY, maxX, maxY } = bounds3301;
+    const points = [];
+
+    // Top edge: left to right (Y = maxY, X varies)
+    for (let i = 0; i <= POINTS_PER_EDGE; i++) {
+        const x = minX + (maxX - minX) * (i / POINTS_PER_EDGE);
+        const y = maxY;
+        const latLng = proj4('EPSG:3301', 'WGS84', [x, y]);
+        points.push(L.latLng(latLng[1], latLng[0]));
+    }
+
+    // Right edge: top to bottom (X = maxX, Y varies)
+    for (let i = 1; i <= POINTS_PER_EDGE; i++) {
+        const x = maxX;
+        const y = maxY - (maxY - minY) * (i / POINTS_PER_EDGE);
+        const latLng = proj4('EPSG:3301', 'WGS84', [x, y]);
+        points.push(L.latLng(latLng[1], latLng[0]));
+    }
+
+    // Bottom edge: right to left (Y = minY, X varies)
+    for (let i = 1; i <= POINTS_PER_EDGE; i++) {
+        const x = maxX - (maxX - minX) * (i / POINTS_PER_EDGE);
+        const y = minY;
+        const latLng = proj4('EPSG:3301', 'WGS84', [x, y]);
+        points.push(L.latLng(latLng[1], latLng[0]));
+    }
+
+    // Left edge: bottom to top (X = minX, Y varies) - skip last point (it's the first point)
+    for (let i = 1; i < POINTS_PER_EDGE; i++) {
+        const x = minX;
+        const y = minY + (maxY - minY) * (i / POINTS_PER_EDGE);
+        const latLng = proj4('EPSG:3301', 'WGS84', [x, y]);
+        points.push(L.latLng(latLng[1], latLng[0]));
+    }
+
+    return points;
+}
 
 // Initialize map
 function initMap() {
@@ -146,9 +192,10 @@ function onMouseDown(e) {
 
     drawStartPoint = e.latlng;
 
-    // Remove existing rectangle
-    if (selectionRectangle) {
-        map.removeLayer(selectionRectangle);
+    // Remove existing polygon
+    if (selectionPolygon) {
+        map.removeLayer(selectionPolygon);
+        selectionPolygon = null;
     }
 
     // Disable map dragging while drawing
@@ -159,12 +206,13 @@ function onMouseMove(e) {
     if (!isDrawing || !drawStartPoint) return;
 
     const currentPoint = e.latlng;
-    const bounds = calculateA3Bounds(drawStartPoint, currentPoint);
+    const bounds3301 = calculateA3Bounds(drawStartPoint, currentPoint);
+    const polygonPoints = createGridAlignedPolygon(bounds3301);
 
-    if (selectionRectangle) {
-        selectionRectangle.setBounds(bounds);
+    if (selectionPolygon) {
+        selectionPolygon.setLatLngs(polygonPoints);
     } else {
-        selectionRectangle = L.rectangle(bounds, {
+        selectionPolygon = L.polygon(polygonPoints, {
             color: '#e74c3c',
             weight: 2,
             fillOpacity: 0.2,
@@ -172,7 +220,8 @@ function onMouseMove(e) {
         }).addTo(map);
     }
 
-    updateSelectionInfo(bounds);
+    currentBounds3301 = bounds3301;
+    updateSelectionInfo(bounds3301);
 }
 
 function onMouseUp(e) {
@@ -180,16 +229,15 @@ function onMouseUp(e) {
 
     map.dragging.enable();
 
-    if (selectionRectangle) {
-        currentBounds = selectionRectangle.getBounds();
-        updateSelectionInfo(currentBounds);
+    if (selectionPolygon && currentBounds3301) {
+        updateSelectionInfo(currentBounds3301);
 
         // Update UI
         clearBtn.disabled = false;
         exportBtn.disabled = false;
 
-        // Update rectangle style to solid
-        selectionRectangle.setStyle({
+        // Update polygon style to solid
+        selectionPolygon.setStyle({
             dashArray: null,
             fillOpacity: 0.15
         });
@@ -203,7 +251,7 @@ function onMouseUp(e) {
     map.getContainer().style.cursor = '';
 }
 
-// Calculate bounds maintaining A3 aspect ratio
+// Calculate bounds maintaining A3 aspect ratio - returns EPSG:3301 coordinates
 function calculateA3Bounds(startLatLng, endLatLng) {
     // Convert to EPSG:3301 for accurate measurements
     const start3301 = proj4('WGS84', 'EPSG:3301', [startLatLng.lng, startLatLng.lat]);
@@ -244,45 +292,31 @@ function calculateA3Bounds(startLatLng, endLatLng) {
     const endX = start3301[0] + width * signX;
     const endY = start3301[1] + height * signY;
 
-    // Convert corners back to lat/lng
-    const sw = proj4('EPSG:3301', 'WGS84', [
-        Math.min(start3301[0], endX),
-        Math.min(start3301[1], endY)
-    ]);
-    const ne = proj4('EPSG:3301', 'WGS84', [
-        Math.max(start3301[0], endX),
-        Math.max(start3301[1], endY)
-    ]);
-
-    return L.latLngBounds(
-        L.latLng(sw[1], sw[0]),
-        L.latLng(ne[1], ne[0])
-    );
+    // Return bounds in EPSG:3301
+    return {
+        minX: Math.min(start3301[0], endX),
+        minY: Math.min(start3301[1], endY),
+        maxX: Math.max(start3301[0], endX),
+        maxY: Math.max(start3301[1], endY)
+    };
 }
 
-function updateSelectionInfo(bounds) {
-    if (!bounds) {
+function updateSelectionInfo(bounds3301) {
+    if (!bounds3301) {
         selectionInfo.style.display = 'none';
         return;
     }
 
-    // Convert to EPSG:3301 for measurements
-    const sw = bounds.getSouthWest();
-    const ne = bounds.getNorthEast();
-
-    const sw3301 = proj4('WGS84', 'EPSG:3301', [sw.lng, sw.lat]);
-    const ne3301 = proj4('WGS84', 'EPSG:3301', [ne.lng, ne.lat]);
-
-    const width = Math.abs(ne3301[0] - sw3301[0]);
-    const height = Math.abs(ne3301[1] - sw3301[1]);
+    const width = bounds3301.maxX - bounds3301.minX;
+    const height = bounds3301.maxY - bounds3301.minY;
 
     selectionInfo.style.display = 'block';
     selectionInfo.innerHTML = `
         <strong>Selection:</strong><br>
-        Size: ${(width).toFixed(0)}m x ${(height).toFixed(0)}m<br>
+        Size: ${width.toFixed(0)}m x ${height.toFixed(0)}m<br>
         <span class="coords">
-            SW: ${sw3301[0].toFixed(0)}, ${sw3301[1].toFixed(0)}<br>
-            NE: ${ne3301[0].toFixed(0)}, ${ne3301[1].toFixed(0)}
+            SW: ${bounds3301.minX.toFixed(0)}, ${bounds3301.minY.toFixed(0)}<br>
+            NE: ${bounds3301.maxX.toFixed(0)}, ${bounds3301.maxY.toFixed(0)}
         </span>
     `;
 }
@@ -308,11 +342,11 @@ function setupButtons() {
     });
 
     clearBtn.addEventListener('click', () => {
-        if (selectionRectangle) {
-            map.removeLayer(selectionRectangle);
-            selectionRectangle = null;
+        if (selectionPolygon) {
+            map.removeLayer(selectionPolygon);
+            selectionPolygon = null;
         }
-        currentBounds = null;
+        currentBounds3301 = null;
         clearBtn.disabled = true;
         exportBtn.disabled = true;
         selectionInfo.style.display = 'none';
@@ -320,21 +354,15 @@ function setupButtons() {
 
     exportBtn.addEventListener('click', exportMap);
 
-    // Update rectangle when orientation changes
+    // Update polygon when orientation changes
     orientationSelect.addEventListener('change', () => {
-        if (selectionRectangle && currentBounds) {
-            // Recalculate with new aspect ratio
-            const center = currentBounds.getCenter();
-            const sw = currentBounds.getSouthWest();
-            const ne = currentBounds.getNorthEast();
-
-            // Get current size in meters
-            const sw3301 = proj4('WGS84', 'EPSG:3301', [sw.lng, sw.lat]);
-            const ne3301 = proj4('WGS84', 'EPSG:3301', [ne.lng, ne.lat]);
-
-            const currentWidth = Math.abs(ne3301[0] - sw3301[0]);
-            const currentHeight = Math.abs(ne3301[1] - sw3301[1]);
+        if (selectionPolygon && currentBounds3301) {
+            // Get current size and center
+            const currentWidth = currentBounds3301.maxX - currentBounds3301.minX;
+            const currentHeight = currentBounds3301.maxY - currentBounds3301.minY;
             const currentArea = currentWidth * currentHeight;
+            const centerX = (currentBounds3301.minX + currentBounds3301.maxX) / 2;
+            const centerY = (currentBounds3301.minY + currentBounds3301.maxY) / 2;
 
             // Calculate new dimensions with same area but new ratio
             const orientation = orientationSelect.value;
@@ -343,33 +371,25 @@ function setupButtons() {
             const newHeight = Math.sqrt(currentArea / ratio);
             const newWidth = newHeight * ratio;
 
-            // Convert center to EPSG:3301
-            const center3301 = proj4('WGS84', 'EPSG:3301', [center.lng, center.lat]);
+            // Calculate new bounds in EPSG:3301
+            currentBounds3301 = {
+                minX: centerX - newWidth / 2,
+                minY: centerY - newHeight / 2,
+                maxX: centerX + newWidth / 2,
+                maxY: centerY + newHeight / 2
+            };
 
-            // Calculate new bounds
-            const newSW = proj4('EPSG:3301', 'WGS84', [
-                center3301[0] - newWidth / 2,
-                center3301[1] - newHeight / 2
-            ]);
-            const newNE = proj4('EPSG:3301', 'WGS84', [
-                center3301[0] + newWidth / 2,
-                center3301[1] + newHeight / 2
-            ]);
-
-            currentBounds = L.latLngBounds(
-                L.latLng(newSW[1], newSW[0]),
-                L.latLng(newNE[1], newNE[0])
-            );
-
-            selectionRectangle.setBounds(currentBounds);
-            updateSelectionInfo(currentBounds);
+            // Update polygon
+            const polygonPoints = createGridAlignedPolygon(currentBounds3301);
+            selectionPolygon.setLatLngs(polygonPoints);
+            updateSelectionInfo(currentBounds3301);
         }
     });
 }
 
 // Export map
 async function exportMap() {
-    if (!currentBounds) {
+    if (!currentBounds3301) {
         alert('Please draw a selection rectangle first.');
         return;
     }
@@ -377,18 +397,12 @@ async function exportMap() {
     const orientation = orientationSelect.value;
     const layer = layerSelect.value;
 
-    // Convert bounds to EPSG:3301
-    const sw = currentBounds.getSouthWest();
-    const ne = currentBounds.getNorthEast();
-
-    const sw3301 = proj4('WGS84', 'EPSG:3301', [sw.lng, sw.lat]);
-    const ne3301 = proj4('WGS84', 'EPSG:3301', [ne.lng, ne.lat]);
-
+    // Bounds are already in EPSG:3301
     const bbox = {
-        minx: sw3301[0],
-        miny: sw3301[1],
-        maxx: ne3301[0],
-        maxy: ne3301[1]
+        minx: currentBounds3301.minX,
+        miny: currentBounds3301.minY,
+        maxx: currentBounds3301.maxX,
+        maxy: currentBounds3301.maxY
     };
 
     // Show loading
@@ -414,7 +428,7 @@ async function exportMap() {
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `mapant_a3_${orientation}.png`;
+        a.download = `${layer}_a3_${orientation}.png`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
