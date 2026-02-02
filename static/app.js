@@ -47,8 +47,14 @@ let isDrawing = false;
 let drawStartPoint = null;
 let currentBounds3301 = null; // Stored in EPSG:3301 {minX, minY, maxX, maxY}
 
+// Mobile state
+let isTouchDevice = false;
+const MOBILE_OVERLAY_SCALE = 0.7; // Overlay takes 70% of screen (smaller dimension)
+
 // Number of points per edge for grid-aligned polygon
 const POINTS_PER_EDGE = 20;
+
+const MAX_SELECTION_SIZE = 20000; // 20km max in meters
 
 // DOM Elements
 const drawBtn = document.getElementById('draw-btn');
@@ -59,6 +65,10 @@ const layerSelect = document.getElementById('layer-select');
 const loadingOverlay = document.getElementById('loading');
 const selectionInfo = document.getElementById('selection-info');
 const attributionText = document.getElementById('attribution');
+
+// Mobile DOM Elements
+const selectionOverlay = document.getElementById('selection-overlay');
+const overlaySizeLabel = document.getElementById('overlay-size-label');
 
 // Layer attributions
 const LAYER_ATTRIBUTIONS = {
@@ -107,6 +117,140 @@ function createGridAlignedPolygon(bounds3301) {
     }
 
     return points;
+}
+
+/**
+ * Detect if this is a touch device
+ */
+function detectTouchDevice() {
+    return ('ontouchstart' in window) ||
+           (navigator.maxTouchPoints > 0) ||
+           (navigator.msMaxTouchPoints > 0);
+}
+
+/**
+ * Get the current overlay dimensions in pixels (fixed to screen size)
+ */
+function getOverlayDimensions() {
+    // Use viewport dimensions since overlay is positioned relative to viewport
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+
+    const orientation = orientationSelect.value;
+    const ratio = orientation === 'landscape' ? A3_RATIO_LANDSCAPE : A3_RATIO_PORTRAIT;
+
+    // Calculate overlay size to fit within viewport with current scale
+    const maxWidth = viewportWidth * MOBILE_OVERLAY_SCALE;
+    const maxHeight = viewportHeight * MOBILE_OVERLAY_SCALE;
+
+    let overlayWidth, overlayHeight;
+
+    if (maxWidth / ratio <= maxHeight) {
+        // Width is the limiting factor
+        overlayWidth = maxWidth;
+        overlayHeight = maxWidth / ratio;
+    } else {
+        // Height is the limiting factor
+        overlayHeight = maxHeight;
+        overlayWidth = maxHeight * ratio;
+    }
+
+    return { width: overlayWidth, height: overlayHeight };
+}
+
+/**
+ * Calculate selection bounds from overlay position for mobile mode
+ */
+function calculateBoundsFromCenter() {
+    const mapContainer = map.getContainer();
+    const mapRect = mapContainer.getBoundingClientRect();
+
+    const { width: overlayWidth, height: overlayHeight } = getOverlayDimensions();
+
+    // Overlay is centered on viewport, get viewport center
+    const viewportCenterX = window.innerWidth / 2;
+    const viewportCenterY = window.innerHeight / 2;
+
+    // Convert viewport coordinates to map container coordinates
+    const mapCenterX = viewportCenterX - mapRect.left;
+    const mapCenterY = viewportCenterY - mapRect.top;
+
+    // Get the lat/lng coordinates of the overlay corners (relative to map container)
+    const topLeftPx = L.point(mapCenterX - overlayWidth / 2, mapCenterY - overlayHeight / 2);
+    const bottomRightPx = L.point(mapCenterX + overlayWidth / 2, mapCenterY + overlayHeight / 2);
+
+    const topLeftLatLng = map.containerPointToLatLng(topLeftPx);
+    const bottomRightLatLng = map.containerPointToLatLng(bottomRightPx);
+
+    // Convert to EPSG:3301
+    const topLeft3301 = proj4('WGS84', 'EPSG:3301', [topLeftLatLng.lng, topLeftLatLng.lat]);
+    const bottomRight3301 = proj4('WGS84', 'EPSG:3301', [bottomRightLatLng.lng, bottomRightLatLng.lat]);
+
+    return {
+        minX: Math.min(topLeft3301[0], bottomRight3301[0]),
+        minY: Math.min(topLeft3301[1], bottomRight3301[1]),
+        maxX: Math.max(topLeft3301[0], bottomRight3301[0]),
+        maxY: Math.max(topLeft3301[1], bottomRight3301[1])
+    };
+}
+
+/**
+ * Update the mobile selection overlay size and label
+ */
+function updateMobileOverlay() {
+    if (!isTouchDevice || !map) return;
+
+    const { width: overlayWidth, height: overlayHeight } = getOverlayDimensions();
+
+    // Set fixed overlay size
+    selectionOverlay.style.width = overlayWidth + 'px';
+    selectionOverlay.style.height = overlayHeight + 'px';
+
+    // Calculate geographic size for the label
+    const bounds = calculateBoundsFromCenter();
+    const geoWidth = bounds.maxX - bounds.minX;
+    const geoHeight = bounds.maxY - bounds.minY;
+
+    // Check if exceeds max size
+    const exceedsMax = geoWidth > MAX_SELECTION_SIZE || geoHeight > MAX_SELECTION_SIZE;
+
+    // Update size label
+    let label;
+    if (geoWidth >= 1000) {
+        label = `${(geoWidth / 1000).toFixed(1)}km × ${(geoHeight / 1000).toFixed(1)}km`;
+    } else {
+        label = `${geoWidth.toFixed(0)}m × ${geoHeight.toFixed(0)}m`;
+    }
+
+    if (exceedsMax) {
+        label += ' (zoom in)';
+        selectionOverlay.style.borderColor = '#f39c12'; // Orange = too large
+        exportBtn.disabled = true;
+    } else {
+        selectionOverlay.style.borderColor = '#e74c3c'; // Red = valid
+        exportBtn.disabled = false;
+    }
+
+    overlaySizeLabel.textContent = label;
+}
+
+/**
+ * Setup mobile mode
+ */
+function setupMobileMode() {
+    // Add touch-device class to body
+    document.body.classList.add('touch-device');
+
+    // Show the selection overlay
+    selectionOverlay.classList.add('visible');
+
+    // Update overlay on map move/zoom
+    map.on('move', updateMobileOverlay);
+    map.on('zoom', updateMobileOverlay);
+    map.on('resize', updateMobileOverlay);
+
+    // Initial overlay update
+    updateMobileOverlay();
 }
 
 // Initialize map
@@ -158,6 +302,12 @@ function initMap() {
     setupDrawing();
     setupButtons();
     setupLayerToggle();
+
+    // Detect touch device and setup mobile mode
+    isTouchDevice = detectTouchDevice();
+    if (isTouchDevice) {
+        setupMobileMode();
+    }
 }
 
 // Setup layer toggle
@@ -209,13 +359,20 @@ function onMouseMove(e) {
     const bounds3301 = calculateA3Bounds(drawStartPoint, currentPoint);
     const polygonPoints = createGridAlignedPolygon(bounds3301);
 
+    // Check if selection is at max size (capped)
+    const width = bounds3301.maxX - bounds3301.minX;
+    const height = bounds3301.maxY - bounds3301.minY;
+    const isAtMax = width >= MAX_SELECTION_SIZE - 1 || height >= MAX_SELECTION_SIZE - 1;
+    const polygonColor = isAtMax ? '#e74c3c' : '#27ae60'; // Red if at max, green if valid
+
     if (selectionPolygon) {
         selectionPolygon.setLatLngs(polygonPoints);
+        selectionPolygon.setStyle({ color: polygonColor });
     } else {
         selectionPolygon = L.polygon(polygonPoints, {
-            color: '#e74c3c',
+            color: polygonColor,
             weight: 2,
-            fillOpacity: 0.2,
+            fillOpacity: 0,
             dashArray: '5, 5'
         }).addTo(map);
     }
@@ -232,14 +389,21 @@ function onMouseUp(e) {
     if (selectionPolygon && currentBounds3301) {
         updateSelectionInfo(currentBounds3301);
 
+        // Check if at max size
+        const width = currentBounds3301.maxX - currentBounds3301.minX;
+        const height = currentBounds3301.maxY - currentBounds3301.minY;
+        const isAtMax = width >= MAX_SELECTION_SIZE - 1 || height >= MAX_SELECTION_SIZE - 1;
+        const polygonColor = isAtMax ? '#e74c3c' : '#27ae60';
+
         // Update UI
         clearBtn.disabled = false;
         exportBtn.disabled = false;
 
         // Update polygon style to solid
         selectionPolygon.setStyle({
+            color: polygonColor,
             dashArray: null,
-            fillOpacity: 0.15
+            fillOpacity: 0
         });
     }
 
@@ -354,9 +518,13 @@ function setupButtons() {
 
     exportBtn.addEventListener('click', exportMap);
 
-    // Update polygon when orientation changes
+    // Update polygon/overlay when orientation changes
     orientationSelect.addEventListener('change', () => {
-        if (selectionPolygon && currentBounds3301) {
+        if (isTouchDevice) {
+            // Mobile: update overlay
+            updateMobileOverlay();
+        } else if (selectionPolygon && currentBounds3301) {
+            // Desktop: update polygon
             // Get current size and center
             const currentWidth = currentBounds3301.maxX - currentBounds3301.minX;
             const currentHeight = currentBounds3301.maxY - currentBounds3301.minY;
@@ -389,20 +557,28 @@ function setupButtons() {
 
 // Export map
 async function exportMap() {
-    if (!currentBounds3301) {
-        alert('Please draw a selection rectangle first.');
-        return;
-    }
-
     const orientation = orientationSelect.value;
     const layer = layerSelect.value;
 
-    // Bounds are already in EPSG:3301
+    let bounds;
+
+    if (isTouchDevice) {
+        // Mobile: calculate bounds from current viewport center
+        bounds = calculateBoundsFromCenter();
+    } else {
+        // Desktop: use drawn selection
+        if (!currentBounds3301) {
+            alert('Please draw a selection rectangle first.');
+            return;
+        }
+        bounds = currentBounds3301;
+    }
+
     const bbox = {
-        minx: currentBounds3301.minX,
-        miny: currentBounds3301.minY,
-        maxx: currentBounds3301.maxX,
-        maxy: currentBounds3301.maxY
+        minx: bounds.minX,
+        miny: bounds.minY,
+        maxx: bounds.maxX,
+        maxy: bounds.maxY
     };
 
     // Show loading
