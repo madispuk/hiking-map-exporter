@@ -61,6 +61,7 @@ def export_map():
     bbox = data.get('bbox')
     orientation = data.get('orientation', 'landscape')
     layer = data.get('layer', 'mapant')
+    grid = data.get('grid', True)
 
     if layer not in LAYERS:
         layer = 'mapant'
@@ -138,8 +139,13 @@ def export_map():
             if tile_image:
                 final_image.paste(tile_image, (spec['px_left'], spec['px_top']))
 
-    # Add scale bar
     meters_per_pixel = geo_width / output_width
+
+    # Add grid overlay if enabled
+    if grid:
+        draw_grid(final_image, minx, miny, maxx, maxy, meters_per_pixel)
+
+    # Add scale bar
     draw_scale_bar(final_image, meters_per_pixel)
 
     # Save to buffer and return
@@ -155,6 +161,57 @@ def export_map():
         as_attachment=True,
         download_name=filename
     )
+
+
+def draw_grid(image, minx, miny, maxx, maxy, meters_per_pixel):
+    """Draw a thin black grid overlay on the image, aligned to coordinate system."""
+    # Grid spacing options (in meters)
+    grid_options = [100, 200, 500, 1000, 2000, 5000]
+
+    # Target: grid cells should be roughly 5-15% of image width
+    target_cell_px = image.width * 0.10
+    target_cell_meters = target_cell_px * meters_per_pixel
+
+    # Find the best grid spacing
+    grid_spacing = grid_options[0]
+    for spacing in grid_options:
+        if spacing <= target_cell_meters * 1.5:
+            grid_spacing = spacing
+
+    draw = ImageDraw.Draw(image)
+    line_color = (0, 0, 0, 80)  # Semi-transparent black
+
+    # Create overlay for semi-transparent lines
+    overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+
+    geo_width = maxx - minx
+    geo_height = maxy - miny
+
+    # Draw vertical lines (constant X in EPSG:3301)
+    # Start from first grid line >= minx
+    first_x = math.ceil(minx / grid_spacing) * grid_spacing
+    x = first_x
+    while x <= maxx:
+        # Convert geo X to pixel X
+        px_x = int((x - minx) / geo_width * image.width)
+        if 0 <= px_x < image.width:
+            overlay_draw.line([(px_x, 0), (px_x, image.height)], fill=line_color, width=1)
+        x += grid_spacing
+
+    # Draw horizontal lines (constant Y in EPSG:3301)
+    # Start from first grid line >= miny
+    first_y = math.ceil(miny / grid_spacing) * grid_spacing
+    y = first_y
+    while y <= maxy:
+        # Convert geo Y to pixel Y (Y is inverted: higher geo Y = lower pixel Y)
+        px_y = int((maxy - y) / geo_height * image.height)
+        if 0 <= px_y < image.height:
+            overlay_draw.line([(0, px_y), (image.width, px_y)], fill=line_color, width=1)
+        y += grid_spacing
+
+    # Composite the grid overlay onto the image
+    image.paste(Image.alpha_composite(image.convert('RGBA'), overlay).convert('RGB'))
 
 
 def draw_scale_bar(image, meters_per_pixel):

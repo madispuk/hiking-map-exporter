@@ -65,6 +65,7 @@ const layerSelect = document.getElementById('layer-select');
 const loadingOverlay = document.getElementById('loading');
 const selectionInfo = document.getElementById('selection-info');
 const attributionText = document.getElementById('attribution');
+const gridCheckbox = document.getElementById('grid-checkbox');
 
 // Mobile DOM Elements
 const selectionOverlay = document.getElementById('selection-overlay');
@@ -359,18 +360,11 @@ function onMouseMove(e) {
     const bounds3301 = calculateA3Bounds(drawStartPoint, currentPoint);
     const polygonPoints = createGridAlignedPolygon(bounds3301);
 
-    // Check if selection is at max size (capped)
-    const width = bounds3301.maxX - bounds3301.minX;
-    const height = bounds3301.maxY - bounds3301.minY;
-    const isAtMax = width >= MAX_SELECTION_SIZE - 1 || height >= MAX_SELECTION_SIZE - 1;
-    const polygonColor = isAtMax ? '#e74c3c' : '#27ae60'; // Red if at max, green if valid
-
     if (selectionPolygon) {
         selectionPolygon.setLatLngs(polygonPoints);
-        selectionPolygon.setStyle({ color: polygonColor });
     } else {
         selectionPolygon = L.polygon(polygonPoints, {
-            color: polygonColor,
+            color: '#e74c3c',
             weight: 2,
             fillOpacity: 0,
             dashArray: '5, 5'
@@ -389,21 +383,13 @@ function onMouseUp(e) {
     if (selectionPolygon && currentBounds3301) {
         updateSelectionInfo(currentBounds3301);
 
-        // Check if at max size
-        const width = currentBounds3301.maxX - currentBounds3301.minX;
-        const height = currentBounds3301.maxY - currentBounds3301.minY;
-        const isAtMax = width >= MAX_SELECTION_SIZE - 1 || height >= MAX_SELECTION_SIZE - 1;
-        const polygonColor = isAtMax ? '#e74c3c' : '#27ae60';
-
         // Update UI
         clearBtn.disabled = false;
         exportBtn.disabled = false;
 
         // Update polygon style to solid
         selectionPolygon.setStyle({
-            color: polygonColor,
-            dashArray: null,
-            fillOpacity: 0
+            dashArray: null
         });
     }
 
@@ -559,6 +545,7 @@ function setupButtons() {
 async function exportMap() {
     const orientation = orientationSelect.value;
     const layer = layerSelect.value;
+    const grid = gridCheckbox.checked;
 
     let bounds;
 
@@ -591,7 +578,7 @@ async function exportMap() {
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ bbox, orientation, layer })
+            body: JSON.stringify({ bbox, orientation, layer, grid })
         });
 
         if (!response.ok) {
