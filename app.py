@@ -8,14 +8,30 @@ export requests by fetching and stitching WMS tiles.
 import io
 import math
 import os
+import secrets
+import string
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, send_file, jsonify
+from werkzeug.middleware.proxy_fix import ProxyFix
 from PIL import Image, ImageDraw, ImageFont
 import requests
 
 app = Flask(__name__, static_folder='static', static_url_path='')
+
+# One reverse proxy (Caddy) in front: trust exactly one hop of X-Forwarded-*,
+# so request.remote_addr is the client, not the proxy. Direct hits (the
+# container healthcheck) carry no such header and keep their real address.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+# Correlation id for log lines: 36 random bits as 6 URL-safe base64 chars.
+ID_ALPHABET = string.ascii_uppercase + string.ascii_lowercase + string.digits + '-_'
+
+
+def correlation_id():
+    n = secrets.randbits(36)
+    return ''.join(ID_ALPHABET[(n >> (6 * i)) & 63] for i in range(6))
 
 # WMS Configuration
 WMS_CRS = "EPSG:3301"
@@ -346,7 +362,11 @@ def export_map():
     Output size is derived from the bbox. An "orientation" key is accepted for
     older clients but ignored: the bbox already determines the shape.
     """
-    data = request.get_json()
+    rid = correlation_id()
+    data = request.get_json(silent=True)
+    print(f"[{rid}] export requested from {request.remote_addr}: "
+          f"layer={data.get('layer', 'mapant') if isinstance(data, dict) else '?'} "
+          f"bbox={data.get('bbox') if isinstance(data, dict) else data}")
 
     if not data:
         return jsonify({"error": "No JSON data provided"}), 400
@@ -383,12 +403,6 @@ def export_map():
     config = LAYERS[layer]
     max_tiles = MAX_TILES_OVERRIDE or config['max_tiles']
 
-    def missing(fetch_mpp, scale, blocks):
-        """Grid tiles this plan needs that are not fresh in the cache."""
-        touched = tiles_touched(blocks, scale, *fetch_grid(minx, maxy, fetch_mpp))
-        return [t for t in sorted(touched)
-                if not cache_fresh(cache_path(layer, fetch_mpp, *t))]
-
     # The plan is the same with or without a cache, so a cold cached export is
     # never coarser than an uncached one. A cold export touches up to
     # (cols+1)*(rows+1) grid tiles rather than cols*rows blocks; that overshoot
@@ -399,12 +413,21 @@ def export_map():
         geo_width, geo_height, output_width, output_height,
         config['native_mpp'], max_tiles)
 
+    started = time.time()
     with export_slots:
         if CACHE_DIR:
-            misses = missing(fetch_mpp, scale, blocks)
+            touched = sorted(tiles_touched(blocks, scale, *fetch_grid(minx, maxy, fetch_mpp)))
+            misses = [t for t in touched
+                      if not cache_fresh(cache_path(layer, fetch_mpp, *t))]
             with ThreadPoolExecutor(max_workers=config['workers']) as executor:
                 ok = list(executor.map(
                     lambda t: fetch_grid_tile(layer, fetch_mpp, *t), misses))
+
+            hits = len(touched) - len(misses)
+            print(f"[{rid}] cache: {layer} {fetch_mpp:g} m/px, {len(touched)} tiles, "
+                  f"{hits} hit, {ok.count(True)} fetched, {ok.count(False)} failed, "
+                  f"hit rate {hits / len(touched):.0%}")
+
             if not all(ok):
                 return jsonify({
                     "error": f"{ok.count(False)} of {len(misses)} map tiles could "
@@ -413,13 +436,33 @@ def export_map():
                 }), 502
             if misses:
                 cache_evict()
-        return render_and_send(minx, miny, maxx, maxy, output_width, output_height,
-                               fetch_mpp, scale, blocks, layer, grid)
+            fetched = time.time()
+
+        response, timing, nbytes = render_and_send(
+            minx, miny, maxx, maxy, output_width, output_height,
+            fetch_mpp, scale, blocks, layer, grid)
+
+    # Without a cache each block fetches its own source inside render, so the
+    # phases cannot be separated; with one, fetch is the prefetch above.
+    if CACHE_DIR:
+        phases = (f"{len(touched)} tiles -> {len(blocks)} blocks, "
+                  f"fetch {fetched - started:.1f}s, render {timing['render']:.1f}s")
+    else:
+        phases = f"{len(blocks)} blocks, fetch+render {timing['render']:.1f}s"
+    print(f"[{rid}] export: {layer} {fetch_mpp:g} m/px -> {output_width}x{output_height}, "
+          f"{phases}, encode {timing['encode']:.1f}s, {nbytes / 1e6:.1f} MB, "
+          f"total {time.time() - started:.1f}s")
+    return response
 
 
 def render_and_send(minx, miny, maxx, maxy, output_width, output_height,
                     fetch_mpp, scale, blocks, layer, grid):
-    """The memory-heavy half of an export, run under `export_slots`."""
+    """The memory-heavy half of an export, run under `export_slots`.
+
+    Returns (response, timing, nbytes); timing has 'render' (blocks and
+    overlays) and 'encode' seconds.
+    """
+    started = time.time()
     final_image = Image.new('RGB', (output_width, output_height), (255, 255, 255))
 
     # Each worker holds one source tile plus its resampled block; the full
@@ -441,12 +484,14 @@ def render_and_send(minx, miny, maxx, maxy, output_width, output_height,
                 final_image.paste(piece, (ox0, oy0))
 
     if failed:
-        return jsonify({
+        error = jsonify({
             "error": f"{failed} of {len(blocks)} map tiles could not be "
                      f"fetched, so the export would have had blank areas. "
                      f"The tile server may be rate limiting; try again, or "
                      f"lower EXPORT_MAX_TILES."
-        }), 502
+        })
+        error.status_code = 502
+        return error, {'render': time.time() - started, 'encode': 0.0}, 0
 
     meters_per_pixel = (maxx - minx) / output_width
 
@@ -457,19 +502,24 @@ def render_and_send(minx, miny, maxx, maxy, output_width, output_height,
     # Add scale bar
     draw_scale_bar(final_image, meters_per_pixel)
 
+    rendered = time.time()
+
     # Encode. Gunicorn streams this response from the worker, so payload size
     # decides how long the request stays open -- keep it small.
     buffer, mimetype, ext = encode_image(final_image, layer)
+    encoded = time.time()
 
     shape = 'landscape' if output_width >= output_height else 'portrait'
     filename = f"{layer}_a3_{shape}.{ext}"
 
-    return send_file(
+    response = send_file(
         buffer,
         mimetype=mimetype,
         as_attachment=True,
         download_name=filename
     )
+    timing = {'render': rendered - started, 'encode': encoded - rendered}
+    return response, timing, buffer.getbuffer().nbytes
 
 
 def encode_image(image, layer):
