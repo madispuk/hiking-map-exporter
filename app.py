@@ -7,6 +7,9 @@ export requests by fetching and stitching WMS tiles.
 
 import io
 import math
+import os
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, send_file, jsonify
 from PIL import Image, ImageDraw, ImageFont
@@ -26,7 +29,13 @@ LAYERS = {
         'format': 'image/png',
         # Cartography uses ~180 distinct colours, so a 256-entry palette is
         # bit-exact here and cuts the response from 16 MB to 6 MB.
-        'export': ('PNG', 'image/png', 'png')
+        'export': ('PNG', 'image/png', 'png'),
+        # Measured by requesting one patch at rising densities until the result
+        # stopped changing. Asking finer than this returns upsampled pixels.
+        'native_mpp': 1.0,
+        # MapAnt rate-limits bursts (429 at ~48 rapid requests), so go gently.
+        'max_tiles': 16,
+        'workers': 2
     },
     'ortho': {
         'url': 'https://kaart.maaamet.ee/wms/fotokaart',
@@ -34,7 +43,13 @@ LAYERS = {
         'format': 'image/jpeg',
         # Photography: lossless PNG lands at 38 MB to preserve the artefacts of
         # an already-JPEG source. See JPEG_QUALITY for the re-encode tradeoff.
-        'export': ('JPEG', 'image/jpeg', 'jpg')
+        'export': ('JPEG', 'image/jpeg', 'jpg'),
+        'native_mpp': 0.25,
+        # Maa-amet is slow (~5 s a request) but has never rate-limited us: fewer
+        # tiles, more in flight. 6 tiles still gives ~2.2x oversampling on a
+        # 10 km sheet in ~16 s; 15 tiles took 80 s for little visible gain.
+        'max_tiles': 6,
+        'workers': 4
     }
 }
 
@@ -54,10 +69,141 @@ JPEG_QUALITY = 95
 A3_LANDSCAPE = (4961, 3508)
 A3_PORTRAIT = (3508, 4961)
 
+# How many pixels an export gets, regardless of shape. Default is an A3 sheet
+# at 300 DPI, so an A3-ratio bbox comes out at exactly 4961x3508. Raise it with
+# EXPORT_MEGAPIXELS to keep more of the source detail on large selections, at
+# the cost of a proportionally bigger download.
+PIXEL_BUDGET = (int(float(os.environ['EXPORT_MEGAPIXELS']) * 1e6)
+                if 'EXPORT_MEGAPIXELS' in os.environ
+                else A3_LANDSCAPE[0] * A3_LANDSCAPE[1])
+
+# Guard against a pathological aspect ratio turning into thousands of tiles.
+MAX_OUTPUT_EDGE = 20000
+
+# The server only ever has its native raster (1 m/px for MapAnt). Asking it to
+# draw at any other scale makes it resample -- smearing small selections into
+# blurry, 57-colour blobs and dropping thin features from large ones. So the
+# export never asks it to: it fetches the raster at native resolution and
+# resamples once, locally, with Lanczos. How close to native a fetch can get is
+# bounded only by each layer's request budget (`max_tiles` above, overridable
+# with EXPORT_MAX_TILES); past it the fetch is coarsened just enough to fit.
+MAX_TILES_OVERRIDE = int(os.environ['EXPORT_MAX_TILES']) if 'EXPORT_MAX_TILES' in os.environ else None
+WMS_RETRIES = 3
+
+# An export holds a couple of 4000x4000 source tiles plus the sheet and its
+# overlay buffers: ~550 MB peak for a 16.5 km sheet. Bound how many run at once
+# per process so thread count cannot multiply that.
+EXPORT_CONCURRENCY = max(1, int(os.environ.get('EXPORT_CONCURRENCY', '2')))
+export_slots = threading.BoundedSemaphore(EXPORT_CONCURRENCY)
+
+def block_margin(scale):
+    """Source pixels to fetch beyond each block edge so Lanczos has its full
+    support (3 output px, i.e. 3 * scale source px) at the join. Fetched,
+    resampled and cropped away, so blocks join seamlessly."""
+    return math.ceil(3 * max(scale, 1.0)) + 2
+
+
+def compute_output_size(geo_width, geo_height):
+    """Pixel size for a bbox: the ratio it asks for, with square pixels.
+
+    Square pixels are the point. The WMS scales a request by width alone and
+    anchors it top-left, so a tile whose pixel aspect differs from its bbox
+    aspect comes back showing a different patch of ground -- which turned a
+    non-A3 selection into a silent collage. Keeping the output at the bbox ratio
+    makes every tile's aspect match its bbox by construction.
+
+    Picking the shape here rather than from a paper size is what lets the UI
+    stay in charge: it constrains selections to A3, and anything else exports
+    honestly at whatever ratio it was given.
+    """
+    aspect = geo_width / geo_height
+
+    width = math.sqrt(PIXEL_BUDGET * aspect)
+    height = width / aspect
+
+    longest = max(width, height)
+    if longest > MAX_OUTPUT_EDGE:
+        # Scale both axes together: lower resolution, still square pixels.
+        width *= MAX_OUTPUT_EDGE / longest
+        height *= MAX_OUTPUT_EDGE / longest
+
+    return max(round(width), 1), max(round(height), 1)
+
 
 @app.route('/')
 def index():
     return app.send_static_file('index.html')
+
+
+def plan_render(geo_width, geo_height, output_width, output_height, native_mpp,
+                max_tiles):
+    """Decide the fetch resolution and split the output into blocks.
+
+    Returns (fetch_mpp, scale, blocks) where scale is fetched pixels per output
+    pixel and each block is (ox0, oy0, ox1, oy1) in output pixels.
+
+    The fetch starts at native resolution and, if the block count would exceed
+    max_tiles, is coarsened in whole multiples of the native pixel. Whole
+    multiples matter: the fetch grid is anchored to the raster (see
+    render_block), and only requests whose corners land on raster pixels come
+    back consistent between windows.
+    """
+    output_mpp = geo_width / output_width
+    multiple = 1
+    while True:
+        fetch_mpp = native_mpp * multiple
+        scale = output_mpp / fetch_mpp
+        usable = MAX_TILE_SIZE - 2 * block_margin(scale)
+        block = max(1, int(usable / scale))
+        cols = math.ceil(output_width / block)
+        rows = math.ceil(output_height / block)
+        if cols * rows <= max_tiles or fetch_mpp >= output_mpp * usable:
+            break
+        multiple += 1
+
+    blocks = [(x, y, min(x + block, output_width), min(y + block, output_height))
+              for y in range(0, output_height, block)
+              for x in range(0, output_width, block)]
+    return fetch_mpp, scale, blocks
+
+
+def render_block(minx, maxy, fetch_mpp, scale, block, layer):
+    """Fetch one block at native resolution and resample it to output pixels.
+
+    The fetch grid is anchored to the raster -- whole multiples of fetch_mpp
+    from the origin -- not to the selection. MapAnt returns a *different*
+    resampling of the same ground for every request whose bbox has a
+    fractional-metre corner, so a grid anchored on an arbitrary selection
+    gives neighbouring blocks slightly different pixels and a visible seam.
+    On raster-aligned corners it returns the raw raster, identically every
+    time. The selection's sub-pixel offset is applied here instead, in the
+    resize's float `box`, which is exact.
+
+    Each fetched region is an integer rectangle on that grid, so its bbox
+    aspect matches its pixel aspect exactly and the server never pads it.
+    """
+    grid_x = math.floor(minx / fetch_mpp) * fetch_mpp
+    grid_y = math.ceil(maxy / fetch_mpp) * fetch_mpp
+    off_x = (minx - grid_x) / fetch_mpp      # fetch-px position of output (0, 0)
+    off_y = (grid_y - maxy) / fetch_mpp
+
+    margin = block_margin(scale)
+    ox0, oy0, ox1, oy1 = block
+    fx0 = math.floor(off_x + ox0 * scale) - margin
+    fy0 = math.floor(off_y + oy0 * scale) - margin
+    fx1 = math.ceil(off_x + ox1 * scale) + margin
+    fy1 = math.ceil(off_y + oy1 * scale) + margin
+
+    tile = fetch_wms_tile(
+        grid_x + fx0 * fetch_mpp, grid_y - fy1 * fetch_mpp,
+        grid_x + fx1 * fetch_mpp, grid_y - fy0 * fetch_mpp,
+        fx1 - fx0, fy1 - fy0, layer)
+    if tile is None:
+        return None
+
+    box = (off_x + ox0 * scale - fx0, off_y + oy0 * scale - fy0,
+           off_x + ox1 * scale - fx0, off_y + oy1 * scale - fy0)
+    return tile.convert('RGB').resize((ox1 - ox0, oy1 - oy0), Image.LANCZOS, box=box)
 
 
 @app.route('/api/export', methods=['POST'])
@@ -67,9 +213,11 @@ def export_map():
 
     Expected JSON body:
     {
-        "bbox": {"minx": float, "miny": float, "maxx": float, "maxy": float},
-        "orientation": "landscape" | "portrait"
+        "bbox": {"minx": float, "miny": float, "maxx": float, "maxy": float}
     }
+
+    Output size is derived from the bbox. An "orientation" key is accepted for
+    older clients but ignored: the bbox already determines the shape.
     """
     data = request.get_json()
 
@@ -77,7 +225,6 @@ def export_map():
         return jsonify({"error": "No JSON data provided"}), 400
 
     bbox = data.get('bbox')
-    orientation = data.get('orientation', 'landscape')
     layer = data.get('layer', 'mapant')
     grid = data.get('grid', True)
 
@@ -95,69 +242,59 @@ def export_map():
     except (KeyError, ValueError, TypeError) as e:
         return jsonify({"error": f"Invalid bbox format: {e}"}), 400
 
-    # Determine output dimensions
-    if orientation == 'portrait':
-        output_width, output_height = A3_PORTRAIT
-    else:
-        output_width, output_height = A3_LANDSCAPE
-
-    # Calculate tile grid
-    tiles_x = math.ceil(output_width / MAX_TILE_SIZE)
-    tiles_y = math.ceil(output_height / MAX_TILE_SIZE)
-
     # Calculate geographic extent
     geo_width = maxx - minx
     geo_height = maxy - miny
 
-    # Create output image
+    if geo_width <= 0 or geo_height <= 0:
+        return jsonify({"error": "bbox must have maxx > minx and maxy > miny"}), 400
+
+    # Size from the bbox, not from `orientation`: a bbox and an orientation that
+    # disagree used to be accepted and produce a wrong sheet.
+    output_width, output_height = compute_output_size(geo_width, geo_height)
+
+    config = LAYERS[layer]
+    fetch_mpp, scale, blocks = plan_render(
+        geo_width, geo_height, output_width, output_height,
+        config['native_mpp'], MAX_TILES_OVERRIDE or config['max_tiles'])
+
+    with export_slots:
+        return render_and_send(minx, miny, maxx, maxy, output_width, output_height,
+                               fetch_mpp, scale, blocks, layer, grid)
+
+
+def render_and_send(minx, miny, maxx, maxy, output_width, output_height,
+                    fetch_mpp, scale, blocks, layer, grid):
+    """The memory-heavy half of an export, run under `export_slots`."""
     final_image = Image.new('RGB', (output_width, output_height), (255, 255, 255))
 
-    # Build list of tile specifications
-    tile_specs = []
-    for ty in range(tiles_y):
-        for tx in range(tiles_x):
-            # Calculate pixel bounds for this tile
-            px_left = tx * MAX_TILE_SIZE
-            px_top = ty * MAX_TILE_SIZE
-            px_right = min((tx + 1) * MAX_TILE_SIZE, output_width)
-            px_bottom = min((ty + 1) * MAX_TILE_SIZE, output_height)
-
-            tile_width = px_right - px_left
-            tile_height = px_bottom - px_top
-
-            # Calculate geographic bounds for this tile
-            # Note: pixel Y increases downward, but geo Y increases upward
-            tile_minx = minx + (px_left / output_width) * geo_width
-            tile_maxx = minx + (px_right / output_width) * geo_width
-            tile_maxy = maxy - (px_top / output_height) * geo_height
-            tile_miny = maxy - (px_bottom / output_height) * geo_height
-
-            tile_specs.append({
-                'minx': tile_minx, 'miny': tile_miny,
-                'maxx': tile_maxx, 'maxy': tile_maxy,
-                'width': tile_width, 'height': tile_height,
-                'px_left': px_left, 'px_top': px_top,
-                'layer': layer
-            })
-
-    # Fetch tiles concurrently
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        future_to_spec = {
-            executor.submit(
-                fetch_wms_tile,
-                spec['minx'], spec['miny'], spec['maxx'], spec['maxy'],
-                spec['width'], spec['height'], spec['layer']
-            ): spec
-            for spec in tile_specs
+    # Each worker holds one source tile plus its resampled block; the full
+    # native-resolution sheet never exists in memory.
+    failed = 0
+    with ThreadPoolExecutor(max_workers=LAYERS[layer]['workers']) as executor:
+        future_to_block = {
+            executor.submit(render_block, minx, maxy, fetch_mpp, scale, block, layer): block
+            for block in blocks
         }
+        for future in as_completed(future_to_block):
+            piece = future.result()
+            if piece is None:
+                # Pasting nothing leaves white, and a part-blank sheet that still
+                # returns 200 is worse than no sheet: it looks like a real map.
+                failed += 1
+            else:
+                ox0, oy0, _, _ = future_to_block[future]
+                final_image.paste(piece, (ox0, oy0))
 
-        for future in as_completed(future_to_spec):
-            spec = future_to_spec[future]
-            tile_image = future.result()
-            if tile_image:
-                final_image.paste(tile_image, (spec['px_left'], spec['px_top']))
+    if failed:
+        return jsonify({
+            "error": f"{failed} of {len(blocks)} map tiles could not be "
+                     f"fetched, so the export would have had blank areas. "
+                     f"The tile server may be rate limiting; try again, or "
+                     f"lower EXPORT_MAX_TILES."
+        }), 502
 
-    meters_per_pixel = geo_width / output_width
+    meters_per_pixel = (maxx - minx) / output_width
 
     # Add grid overlay if enabled
     if grid:
@@ -170,7 +307,8 @@ def export_map():
     # decides how long the request stays open -- keep it small.
     buffer, mimetype, ext = encode_image(final_image, layer)
 
-    filename = f"{layer}_a3_{orientation}.{ext}"
+    shape = 'landscape' if output_width >= output_height else 'portrait'
+    filename = f"{layer}_a3_{shape}.{ext}"
 
     return send_file(
         buffer,
@@ -191,16 +329,14 @@ def encode_image(image, layer):
     buffer = io.BytesIO()
     if image_format == 'JPEG':
         image.save(buffer, format='JPEG', quality=JPEG_QUALITY, subsampling=0)
-    elif image.getcolors(maxcolors=256) is not None:
-        # Bit-exact: with <=256 distinct colours the palette holds every one of
-        # them. Costs ~0.02s to verify. optimize=True is not worth ~3s for 6%.
+    else:
+        # Local Lanczos resampling adds edge blends that push the sheet past
+        # 256 colours. Quantising back costs ~0.4 dB but keeps the file at
+        # ~10 MB instead of ~32 MB, and the result is still several dB closer
+        # to the source than a bit-exact sheet the server drew at output scale.
         palette = image.convert('P', palette=Image.ADAPTIVE, colors=256,
                                 dither=Image.NONE)
         palette.save(buffer, format='PNG')
-    else:
-        # More colours than a palette can hold -- never quantise, just pay for
-        # full RGB rather than silently degrade the map.
-        image.save(buffer, format='PNG')
     buffer.seek(0)
     return buffer, mimetype, ext
 
@@ -372,24 +508,51 @@ def fetch_wms_tile(minx, miny, maxx, maxy, width, height, layer='mapant'):
         'STYLES': ''
     }
 
-    try:
-        response = requests.get(layer_config['url'], params=params, timeout=WMS_TIMEOUT)
-        response.raise_for_status()
+    for attempt in range(WMS_RETRIES):
+        try:
+            response = requests.get(layer_config['url'], params=params,
+                                    timeout=WMS_TIMEOUT)
 
-        # Check if response is an image
-        content_type = response.headers.get('Content-Type', '')
-        if 'image' not in content_type:
-            print(f"WMS error: {response.text[:500]}")
+            # Rate limiting and transient server errors are worth waiting out;
+            # a big oversampled export is a burst of requests by nature.
+            if response.status_code in (429, 500, 502, 503, 504):
+                if attempt + 1 < WMS_RETRIES:
+                    time.sleep(retry_delay(response, attempt))
+                    continue
+
+            response.raise_for_status()
+
+            # Check if response is an image
+            content_type = response.headers.get('Content-Type', '')
+            if 'image' not in content_type:
+                print(f"WMS error: {response.text[:500]}")
+                return None
+
+            return Image.open(io.BytesIO(response.content))
+
+        except requests.RequestException as e:
+            if attempt + 1 < WMS_RETRIES:
+                time.sleep(retry_delay(None, attempt))
+                continue
+            print(f"Failed to fetch tile: {e}")
+            return None
+        except Exception as e:
+            print(f"Error processing tile: {e}")
             return None
 
-        return Image.open(io.BytesIO(response.content))
+    return None
 
-    except requests.RequestException as e:
-        print(f"Failed to fetch tile: {e}")
-        return None
-    except Exception as e:
-        print(f"Error processing tile: {e}")
-        return None
+
+def retry_delay(response, attempt):
+    """Backoff before retrying a tile, honouring Retry-After when offered."""
+    if response is not None:
+        header = response.headers.get('Retry-After')
+        if header:
+            try:
+                return min(float(header), 10.0)
+            except ValueError:
+                pass
+    return min(0.5 * (2 ** attempt), 4.0)
 
 
 if __name__ == '__main__':
