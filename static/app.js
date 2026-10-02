@@ -254,19 +254,154 @@ function setupMobileMode() {
     updateMobileOverlay();
 }
 
+/**
+ * URL state, kept in the hash so panning never reloads the page:
+ *
+ *   #map=<cx>,<cy>,<zoom>&sel=<minX>,<minY>,<maxX>,<maxY>&layer=..
+ *
+ * All coordinates are EPSG:3301 metres, matching the selection readout and the
+ * export bbox, rounded to whole metres. `sel` carries the two opposite corners
+ * (SW and NE), which fully describe the rectangle.
+ *
+ * Orientation is deliberately not in the URL: it is a browser-local drawing
+ * preference, and with a `sel` present the corners already imply it. Corners
+ * from a link are used verbatim, including a hand-edited aspect ratio.
+ */
+/**
+ * Which way up a rectangle sits. Used only to line the local orientation
+ * control up with a restored selection, so the export does not letterbox a
+ * portrait rectangle onto a landscape sheet.
+ */
+function orientationOf(bounds3301) {
+    const width = bounds3301.maxX - bounds3301.minX;
+    const height = bounds3301.maxY - bounds3301.minY;
+    return width >= height ? 'landscape' : 'portrait';
+}
+
+function parseHash() {
+    const raw = window.location.hash.replace(/^#/, '');
+    if (!raw) return {};
+
+    const params = new URLSearchParams(raw);
+    const state = {};
+
+    const view = (params.get('map') || '').split(',').map(Number);
+    if (view.length === 3 && view.every(Number.isFinite)) {
+        state.center3301 = [view[0], view[1]];
+        state.zoom = view[2];
+    }
+
+    const sel = (params.get('sel') || '').split(',').map(Number);
+    if (sel.length === 4 && sel.every(Number.isFinite)) {
+        state.bounds3301 = {
+            minX: Math.min(sel[0], sel[2]),
+            minY: Math.min(sel[1], sel[3]),
+            maxX: Math.max(sel[0], sel[2]),
+            maxY: Math.max(sel[1], sel[3])
+        };
+    }
+
+    const layer = params.get('layer');
+    if (layer === 'mapant' || layer === 'ortho') state.layer = layer;
+
+    // Not read from the URL -- derived from the corners, which are the only
+    // thing shared. Without a selection the local control is left alone.
+    if (state.bounds3301) {
+        state.orientation = orientationOf(state.bounds3301);
+    }
+
+    return state;
+}
+
+/**
+ * Write the current view and selection back into the URL.
+ */
+function updateHash() {
+    if (!map) return;
+
+    const center = map.getCenter();
+    const center3301 = proj4('WGS84', 'EPSG:3301', [center.lng, center.lat]);
+
+    const params = new URLSearchParams();
+    params.set('map', [
+        Math.round(center3301[0]),
+        Math.round(center3301[1]),
+        map.getZoom()
+    ].join(','));
+
+    // On touch devices the selection is the centred overlay rather than a drawn
+    // polygon, so derive it the same way the export does. Either way the link
+    // carries a rectangle the recipient can see.
+    const bounds = isTouchDevice ? calculateBoundsFromCenter() : currentBounds3301;
+    if (bounds) {
+        params.set('sel', [bounds.minX, bounds.minY, bounds.maxX, bounds.maxY]
+            .map(Math.round).join(','));
+    }
+
+    params.set('layer', layerSelect.value);
+
+    // replaceState keeps panning out of the back-button history and, unlike
+    // assigning location.hash, does not fire hashchange back at us.
+    const query = params.toString().replace(/%2C/g, ',');
+    history.replaceState(null, '', `${window.location.pathname}#${query}`);
+}
+
+/**
+ * Draw a selection that came from a shared link.
+ */
+function restoreSelection(bounds3301) {
+    currentBounds3301 = bounds3301;
+
+    const polygonPoints = createGridAlignedPolygon(bounds3301);
+    if (selectionPolygon) {
+        selectionPolygon.setLatLngs(polygonPoints);
+    } else {
+        selectionPolygon = L.polygon(polygonPoints, {
+            color: '#e74c3c',
+            weight: 2,
+            fillOpacity: 0
+        }).addTo(map);
+    }
+
+    updateSelectionInfo(bounds3301);
+    clearBtn.disabled = false;
+    exportBtn.disabled = false;
+}
+
 // Initialize map
 function initMap() {
-    // Calculate center of Estonia in EPSG:3301
-    const centerX = (ESTONIA_BOUNDS.minX + ESTONIA_BOUNDS.maxX) / 2;
-    const centerY = (ESTONIA_BOUNDS.minY + ESTONIA_BOUNDS.maxY) / 2;
+    const initial = parseHash();
+
+    // Apply the layer before it is added, so the map comes up on the shared one.
+    // Orientation is local, and only follows a restored rectangle.
+    if (initial.layer) layerSelect.value = initial.layer;
+    if (initial.orientation) orientationSelect.value = initial.orientation;
+
+    // Prefer an explicit view, fall back to centring on a shared selection,
+    // then to the whole of Estonia.
+    let center3301 = [
+        (ESTONIA_BOUNDS.minX + ESTONIA_BOUNDS.maxX) / 2,
+        (ESTONIA_BOUNDS.minY + ESTONIA_BOUNDS.maxY) / 2
+    ];
+    let zoom = 4;
+
+    if (initial.center3301) {
+        center3301 = initial.center3301;
+        zoom = initial.zoom;
+    } else if (initial.bounds3301) {
+        center3301 = [
+            (initial.bounds3301.minX + initial.bounds3301.maxX) / 2,
+            (initial.bounds3301.minY + initial.bounds3301.maxY) / 2
+        ];
+    }
 
     // Convert to lat/lng for Leaflet
-    const centerLatLng = proj4('EPSG:3301', 'WGS84', [centerX, centerY]);
+    const centerLatLng = proj4('EPSG:3301', 'WGS84', center3301);
 
     map = L.map('map', {
         crs: crs3301,
         center: [centerLatLng[1], centerLatLng[0]],
-        zoom: 4,
+        zoom: zoom,
         minZoom: 0,
         maxZoom: 14
     });
@@ -309,6 +444,45 @@ function initMap() {
     if (isTouchDevice) {
         setupMobileMode();
     }
+
+    // A shared rectangle is drawn as a polygon on desktop. On touch the
+    // selection is the fixed centre overlay, so centring the map above is all
+    // that can be restored.
+    if (initial.bounds3301 && !isTouchDevice) {
+        restoreSelection(initial.bounds3301);
+    }
+
+    // moveend covers panning and the end of a zoom.
+    map.on('moveend', updateHash);
+    updateHash();
+
+    // Pasting a different link into an already-open tab only changes the hash,
+    // which would otherwise do nothing. replaceState does not fire this.
+    window.addEventListener('hashchange', applySharedLink);
+}
+
+/**
+ * Re-apply state after the hash is changed externally.
+ */
+function applySharedLink() {
+    const state = parseHash();
+    if (!state.center3301 && !state.bounds3301) return;
+
+    if (state.layer && state.layer !== currentLayer) {
+        layerSelect.value = state.layer;
+        layerSelect.dispatchEvent(new Event('change'));
+    }
+    if (state.orientation) orientationSelect.value = state.orientation;
+
+    if (state.center3301) {
+        const latLng = proj4('EPSG:3301', 'WGS84', state.center3301);
+        map.setView([latLng[1], latLng[0]], state.zoom);
+    }
+    if (state.bounds3301 && !isTouchDevice) {
+        restoreSelection(state.bounds3301);
+    }
+
+    updateHash();
 }
 
 // Setup layer toggle
@@ -328,6 +502,8 @@ function setupLayerToggle() {
 
         // Update attribution text
         attributionText.textContent = LAYER_ATTRIBUTIONS[selectedLayer];
+
+        updateHash();
     });
 }
 
@@ -391,6 +567,8 @@ function onMouseUp(e) {
         selectionPolygon.setStyle({
             dashArray: null
         });
+
+        updateHash();
     }
 
     // Exit drawing mode
@@ -500,6 +678,7 @@ function setupButtons() {
         clearBtn.disabled = true;
         exportBtn.disabled = true;
         selectionInfo.style.display = 'none';
+        updateHash();
     });
 
     exportBtn.addEventListener('click', exportMap);
@@ -509,6 +688,7 @@ function setupButtons() {
         if (isTouchDevice) {
             // Mobile: update overlay
             updateMobileOverlay();
+            updateHash();
         } else if (selectionPolygon && currentBounds3301) {
             // Desktop: update polygon
             // Get current size and center
@@ -537,7 +717,10 @@ function setupButtons() {
             const polygonPoints = createGridAlignedPolygon(currentBounds3301);
             selectionPolygon.setLatLngs(polygonPoints);
             updateSelectionInfo(currentBounds3301);
+            updateHash();
         }
+        // With nothing drawn there is no URL state to update: orientation is
+        // local, and the view has not moved.
     });
 }
 
