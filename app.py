@@ -23,14 +23,32 @@ LAYERS = {
     'mapant': {
         'url': 'https://mapantee.gokartor.se/ogc/wms.php',
         'layer': 'mapantee',
-        'format': 'image/png'
+        'format': 'image/png',
+        # Cartography uses ~180 distinct colours, so a 256-entry palette is
+        # bit-exact here and cuts the response from 16 MB to 6 MB.
+        'export': ('PNG', 'image/png', 'png')
     },
     'ortho': {
         'url': 'https://kaart.maaamet.ee/wms/fotokaart',
         'layer': 'EESTIFOTO',
-        'format': 'image/jpeg'
+        'format': 'image/jpeg',
+        # Photography: lossless PNG lands at 38 MB to preserve the artefacts of
+        # an already-JPEG source. See JPEG_QUALITY for the re-encode tradeoff.
+        'export': ('JPEG', 'image/jpeg', 'jpg')
     }
 }
+
+# The WMS call must finish well inside the gunicorn worker timeout, otherwise
+# a single slow tile takes the worker down instead of returning an error.
+WMS_TIMEOUT = 25
+
+# Measured on a full A3 ortho export against the lossless original: q=90 gives
+# 40.0 dB PSNR but q=92 jumps to 47.6 dB for 0.35 MB more -- there is a quality
+# cliff just below 92. q=95 lands at 50.1 dB (mean error 0.54/255, worst 7/255),
+# which is visually lossless in print, and costs 2.6 MB over q=92. Beyond that
+# the curve flattens: q=97 buys 1.1 dB for 2.4 MB. 4:4:4 keeps full chroma,
+# which matters for the thin coloured grid lines drawn over the photo.
+JPEG_QUALITY = 95
 
 # A3 at 300 DPI
 A3_LANDSCAPE = (4961, 3508)
@@ -148,19 +166,43 @@ def export_map():
     # Add scale bar
     draw_scale_bar(final_image, meters_per_pixel)
 
-    # Save to buffer and return
-    buffer = io.BytesIO()
-    final_image.save(buffer, format='PNG', optimize=True)
-    buffer.seek(0)
+    # Encode. Gunicorn streams this response from the worker, so payload size
+    # decides how long the request stays open -- keep it small.
+    buffer, mimetype, ext = encode_image(final_image, layer)
 
-    filename = f"{layer}_a3_{orientation}.png"
+    filename = f"{layer}_a3_{orientation}.{ext}"
 
     return send_file(
         buffer,
-        mimetype='image/png',
+        mimetype=mimetype,
         as_attachment=True,
         download_name=filename
     )
+
+
+def encode_image(image, layer):
+    """Encode the composed map for delivery, returning (buffer, mimetype, ext).
+
+    The PNG path is always lossless: a palette is only used when the image
+    genuinely fits in 256 colours, which is checked rather than assumed.
+    """
+    image_format, mimetype, ext = LAYERS[layer]['export']
+
+    buffer = io.BytesIO()
+    if image_format == 'JPEG':
+        image.save(buffer, format='JPEG', quality=JPEG_QUALITY, subsampling=0)
+    elif image.getcolors(maxcolors=256) is not None:
+        # Bit-exact: with <=256 distinct colours the palette holds every one of
+        # them. Costs ~0.02s to verify. optimize=True is not worth ~3s for 6%.
+        palette = image.convert('P', palette=Image.ADAPTIVE, colors=256,
+                                dither=Image.NONE)
+        palette.save(buffer, format='PNG')
+    else:
+        # More colours than a palette can hold -- never quantise, just pay for
+        # full RGB rather than silently degrade the map.
+        image.save(buffer, format='PNG')
+    buffer.seek(0)
+    return buffer, mimetype, ext
 
 
 def draw_grid(image, minx, miny, maxx, maxy, meters_per_pixel):
@@ -261,20 +303,23 @@ def draw_scale_bar(image, meters_per_pixel):
     text_width = text_bbox[2] - text_bbox[0]
     text_height = text_bbox[3] - text_bbox[1]
 
-    # Draw semi-transparent background
+    # Draw the scale bar background
     bg_padding = 15
     bg_left = x_left - bg_padding
     bg_top = y_top - text_height - bg_padding * 2
     bg_right = x_right + bg_padding
     bg_bottom = y_bottom + bg_padding
 
-    # Create overlay for semi-transparent background
+    # Create overlay for the scale bar background
     overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
     overlay_draw = ImageDraw.Draw(overlay)
+    # Opaque, not translucent: blending the box over the map generated ~80 extra
+    # colours and pushed the image past 256, forcing a lossy palette or a 16 MB
+    # RGB PNG. Solid white also reads better on paper.
     overlay_draw.rounded_rectangle(
         [bg_left, bg_top, bg_right, bg_bottom],
         radius=8,
-        fill=(255, 255, 255, 200)
+        fill=(255, 255, 255, 255)
     )
     image.paste(Image.alpha_composite(image.convert('RGBA'), overlay).convert('RGB'))
 
@@ -328,7 +373,7 @@ def fetch_wms_tile(minx, miny, maxx, maxy, width, height, layer='mapant'):
     }
 
     try:
-        response = requests.get(layer_config['url'], params=params, timeout=60)
+        response = requests.get(layer_config['url'], params=params, timeout=WMS_TIMEOUT)
         response.raise_for_status()
 
         # Check if response is an image

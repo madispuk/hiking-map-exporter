@@ -586,12 +586,14 @@ async function exportMap() {
             throw new Error(error.error || 'Export failed');
         }
 
-        // Download the image
+        // Download the image. The extension depends on the layer (PNG for
+        // cartography, JPEG for photography), so follow what the server sent.
         const blob = await response.blob();
+        const ext = blob.type === 'image/jpeg' ? 'jpg' : 'png';
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `${layer}_a3_${orientation}.png`;
+        a.download = `${layer}_a3_${orientation}.${ext}`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
