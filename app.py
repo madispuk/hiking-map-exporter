@@ -87,8 +87,26 @@ MAX_OUTPUT_EDGE = 20000
 # resamples once, locally, with Lanczos. How close to native a fetch can get is
 # bounded only by each layer's request budget (`max_tiles` above, overridable
 # with EXPORT_MAX_TILES); past it the fetch is coarsened just enough to fit.
+# With the tile cache on, the budget bounds blocks, not cold tile fetches.
 MAX_TILES_OVERRIDE = int(os.environ['EXPORT_MAX_TILES']) if 'EXPORT_MAX_TILES' in os.environ else None
 WMS_RETRIES = 3
+
+# Server-side tile cache, opt-in. Fetches are cacheable at all only because
+# they are raster-aligned (see render_block): the server returns byte-identical
+# pixels for the same aligned request every time. Tiles live on a fixed global
+# grid -- CACHE_TILE fetch pixels square, at absolute multiples of
+# CACHE_TILE * fetch_mpp metres -- so overlapping selections share them. Stored
+# as the raw bytes the server sent. Neither server offers ETag/Last-Modified,
+# so freshness is a plain TTL; MapAnt regenerates nightly, the content changes
+# rarely. Unset EXPORT_CACHE_DIR means no caching and no change in behaviour.
+CACHE_DIR = os.environ.get('EXPORT_CACHE_DIR') or None
+# Grid tile edge in fetch pixels. Bigger tiles mean fewer requests on a cold
+# export but more wasted edge, worst for small selections: measured on a 2 km
+# selection, 4000 px tiles fetch 11-22x the pixels needed (alignment-dependent),
+# 2000 px tiles 6-9x; a cold 10 km export is 10 requests at 4000 vs 29 at 2000.
+CACHE_TILE = min(MAX_TILE_SIZE, max(500, int(os.environ.get('EXPORT_CACHE_TILE', '4000'))))
+CACHE_TTL = float(os.environ.get('EXPORT_CACHE_TTL_DAYS', '7')) * 86400
+CACHE_MAX_BYTES = int(float(os.environ.get('EXPORT_CACHE_MAX_MB', '2048')) * 1e6)
 
 # An export holds a couple of 4000x4000 source tiles plus the sheet and its
 # overlay buffers: ~550 MB peak for a 16.5 km sheet. Bound how many run at once
@@ -135,6 +153,101 @@ def index():
     return app.send_static_file('index.html')
 
 
+def cache_path(layer, fetch_mpp, col, row):
+    ext = LAYERS[layer]['format'].split('/')[1].replace('jpeg', 'jpg')
+    # Tile size is part of the namespace, so changing it never mixes grids.
+    return os.path.join(CACHE_DIR, layer, f"{fetch_mpp:g}_{CACHE_TILE}", f"{col}_{row}.{ext}")
+
+
+def cache_fresh(path):
+    """True if the tile is on disk and younger than the TTL. Touches it, so
+    eviction below is least-recently-used rather than oldest-written."""
+    try:
+        if time.time() - os.stat(path).st_mtime > CACHE_TTL:
+            return False
+        os.utime(path, None)
+        return True
+    except OSError:
+        return False
+
+
+def cache_put(path, data):
+    """Atomic: a reader never sees a half-written tile, and two gunicorn
+    workers writing the same tile at once just race to an identical result."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, 'wb') as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def cache_evict():
+    """Drop least-recently-used tiles until the cache fits CACHE_MAX_BYTES."""
+    entries = []
+    for root, _, files in os.walk(CACHE_DIR):
+        for name in files:
+            if name.endswith('.tmp'):
+                continue
+            p = os.path.join(root, name)
+            try:
+                st = os.stat(p)
+                entries.append((st.st_mtime, st.st_size, p))
+            except OSError:
+                pass
+    total = sum(size for _, size, _ in entries)
+    for _, size, p in sorted(entries):
+        if total <= CACHE_MAX_BYTES:
+            break
+        try:
+            os.remove(p)
+            total -= size
+        except OSError:
+            pass
+
+
+def tiles_touched(blocks, scale, grid_x, grid_y, off_x, off_y):
+    """The global grid tiles (col, row) a set of blocks reads from, in absolute
+    fetch-pixel space. Row indices count downward from the EPSG:3301 origin."""
+    tiles = set()
+    margin = block_margin(scale)
+    for ox0, oy0, ox1, oy1 in blocks:
+        x0 = grid_x + math.floor(off_x + ox0 * scale) - margin
+        y0 = grid_y + math.floor(off_y + oy0 * scale) - margin
+        x1 = grid_x + math.ceil(off_x + ox1 * scale) + margin
+        y1 = grid_y + math.ceil(off_y + oy1 * scale) + margin
+        for col in range(math.floor(x0 / CACHE_TILE), math.ceil(x1 / CACHE_TILE)):
+            for row in range(math.floor(y0 / CACHE_TILE), math.ceil(y1 / CACHE_TILE)):
+                tiles.add((col, row))
+    return tiles
+
+
+def fetch_grid_tile(layer, fetch_mpp, col, row):
+    """Fetch one global grid tile and store it. Returns True on success."""
+    x0 = col * CACHE_TILE * fetch_mpp
+    y1 = -row * CACHE_TILE * fetch_mpp            # top edge (rows count downward)
+    data = fetch_wms_bytes(x0, y1 - CACHE_TILE * fetch_mpp, x0 + CACHE_TILE * fetch_mpp, y1,
+                           CACHE_TILE, CACHE_TILE, layer)
+    if data is None:
+        return False
+    cache_put(cache_path(layer, fetch_mpp, col, row), data)
+    return True
+
+
+def assemble_from_cache(layer, fetch_mpp, x0, y0, x1, y1):
+    """Build the source rectangle [x0,x1)x[y0,y1) (absolute fetch px) from
+    cached grid tiles. Every tile was prefetched, so a miss here is a bug."""
+    canvas = Image.new('RGB', (x1 - x0, y1 - y0), (255, 255, 255))
+    for col in range(math.floor(x0 / CACHE_TILE), math.ceil(x1 / CACHE_TILE)):
+        for row in range(math.floor(y0 / CACHE_TILE), math.ceil(y1 / CACHE_TILE)):
+            tx, ty = col * CACHE_TILE, row * CACHE_TILE
+            ix0, iy0 = max(x0, tx), max(y0, ty)
+            ix1, iy1 = min(x1, tx + CACHE_TILE), min(y1, ty + CACHE_TILE)
+            with Image.open(cache_path(layer, fetch_mpp, col, row)) as tile:
+                part = tile.crop((ix0 - tx, iy0 - ty, ix1 - tx, iy1 - ty)).convert('RGB')
+            canvas.paste(part, (ix0 - x0, iy0 - y0))
+    return canvas
+
+
 def plan_render(geo_width, geo_height, output_width, output_height, native_mpp,
                 max_tiles):
     """Decide the fetch resolution and split the output into blocks.
@@ -157,14 +270,25 @@ def plan_render(geo_width, geo_height, output_width, output_height, native_mpp,
         block = max(1, int(usable / scale))
         cols = math.ceil(output_width / block)
         rows = math.ceil(output_height / block)
+        blocks = [(x, y, min(x + block, output_width), min(y + block, output_height))
+                  for y in range(0, output_height, block)
+                  for x in range(0, output_width, block)]
         if cols * rows <= max_tiles or fetch_mpp >= output_mpp * usable:
             break
         multiple += 1
 
-    blocks = [(x, y, min(x + block, output_width), min(y + block, output_height))
-              for y in range(0, output_height, block)
-              for x in range(0, output_width, block)]
     return fetch_mpp, scale, blocks
+
+
+def fetch_grid(minx, maxy, fetch_mpp):
+    """Anchor of the raster-aligned fetch grid for a selection, as integer
+    absolute fetch-pixel indices (x rightward, y downward from the EPSG:3301
+    origin), plus the selection's sub-pixel offset within that grid."""
+    grid_x = math.floor(minx / fetch_mpp)
+    grid_y = -math.ceil(maxy / fetch_mpp)
+    off_x = minx / fetch_mpp - grid_x
+    off_y = -maxy / fetch_mpp - grid_y
+    return grid_x, grid_y, off_x, off_y
 
 
 def render_block(minx, maxy, fetch_mpp, scale, block, layer):
@@ -182,25 +306,28 @@ def render_block(minx, maxy, fetch_mpp, scale, block, layer):
     Each fetched region is an integer rectangle on that grid, so its bbox
     aspect matches its pixel aspect exactly and the server never pads it.
     """
-    grid_x = math.floor(minx / fetch_mpp) * fetch_mpp
-    grid_y = math.ceil(maxy / fetch_mpp) * fetch_mpp
-    off_x = (minx - grid_x) / fetch_mpp      # fetch-px position of output (0, 0)
-    off_y = (grid_y - maxy) / fetch_mpp
+    grid_x, grid_y, off_x, off_y = fetch_grid(minx, maxy, fetch_mpp)
 
     margin = block_margin(scale)
     ox0, oy0, ox1, oy1 = block
-    fx0 = math.floor(off_x + ox0 * scale) - margin
-    fy0 = math.floor(off_y + oy0 * scale) - margin
-    fx1 = math.ceil(off_x + ox1 * scale) + margin
-    fy1 = math.ceil(off_y + oy1 * scale) + margin
+    # Absolute fetch-pixel rectangle (rows count downward from the origin).
+    fx0 = grid_x + math.floor(off_x + ox0 * scale) - margin
+    fy0 = grid_y + math.floor(off_y + oy0 * scale) - margin
+    fx1 = grid_x + math.ceil(off_x + ox1 * scale) + margin
+    fy1 = grid_y + math.ceil(off_y + oy1 * scale) + margin
 
-    tile = fetch_wms_tile(
-        grid_x + fx0 * fetch_mpp, grid_y - fy1 * fetch_mpp,
-        grid_x + fx1 * fetch_mpp, grid_y - fy0 * fetch_mpp,
-        fx1 - fx0, fy1 - fy0, layer)
-    if tile is None:
-        return None
+    if CACHE_DIR:
+        tile = assemble_from_cache(layer, fetch_mpp, fx0, fy0, fx1, fy1)
+    else:
+        tile = fetch_wms_tile(fx0 * fetch_mpp, -fy1 * fetch_mpp,
+                              fx1 * fetch_mpp, -fy0 * fetch_mpp,
+                              fx1 - fx0, fy1 - fy0, layer)
+        if tile is None:
+            return None
 
+    # Back to block-relative for the resize box.
+    fx0 -= grid_x
+    fy0 -= grid_y
     box = (off_x + ox0 * scale - fx0, off_y + oy0 * scale - fy0,
            off_x + ox1 * scale - fx0, off_y + oy1 * scale - fy0)
     return tile.convert('RGB').resize((ox1 - ox0, oy1 - oy0), Image.LANCZOS, box=box)
@@ -254,11 +381,38 @@ def export_map():
     output_width, output_height = compute_output_size(geo_width, geo_height)
 
     config = LAYERS[layer]
+    max_tiles = MAX_TILES_OVERRIDE or config['max_tiles']
+
+    def missing(fetch_mpp, scale, blocks):
+        """Grid tiles this plan needs that are not fresh in the cache."""
+        touched = tiles_touched(blocks, scale, *fetch_grid(minx, maxy, fetch_mpp))
+        return [t for t in sorted(touched)
+                if not cache_fresh(cache_path(layer, fetch_mpp, *t))]
+
+    # The plan is the same with or without a cache, so a cold cached export is
+    # never coarser than an uncached one. A cold export touches up to
+    # (cols+1)*(rows+1) grid tiles rather than cols*rows blocks; that overshoot
+    # of the request budget is bounded by the layer's worker count and absorbed
+    # by retry/backoff, and it is what buys hits for every overlapping export
+    # afterwards.
     fetch_mpp, scale, blocks = plan_render(
         geo_width, geo_height, output_width, output_height,
-        config['native_mpp'], MAX_TILES_OVERRIDE or config['max_tiles'])
+        config['native_mpp'], max_tiles)
 
     with export_slots:
+        if CACHE_DIR:
+            misses = missing(fetch_mpp, scale, blocks)
+            with ThreadPoolExecutor(max_workers=config['workers']) as executor:
+                ok = list(executor.map(
+                    lambda t: fetch_grid_tile(layer, fetch_mpp, *t), misses))
+            if not all(ok):
+                return jsonify({
+                    "error": f"{ok.count(False)} of {len(misses)} map tiles could "
+                             f"not be fetched. The tile server may be rate "
+                             f"limiting; try again."
+                }), 502
+            if misses:
+                cache_evict()
         return render_and_send(minx, miny, maxx, maxy, output_width, output_height,
                                fetch_mpp, scale, blocks, layer, grid)
 
@@ -484,7 +638,19 @@ def draw_scale_bar(image, meters_per_pixel):
 
 
 def fetch_wms_tile(minx, miny, maxx, maxy, width, height, layer='mapant'):
-    """Fetch a single tile from the WMS service."""
+    """Fetch a single tile from the WMS service, decoded."""
+    data = fetch_wms_bytes(minx, miny, maxx, maxy, width, height, layer)
+    if data is None:
+        return None
+    try:
+        return Image.open(io.BytesIO(data))
+    except Exception as e:
+        print(f"Error processing tile: {e}")
+        return None
+
+
+def fetch_wms_bytes(minx, miny, maxx, maxy, width, height, layer='mapant'):
+    """Fetch a single tile from the WMS service as the raw encoded bytes."""
     layer_config = LAYERS.get(layer, LAYERS['mapant'])
 
     # WMS 1.3.0 axis order depends on CRS
@@ -528,16 +694,13 @@ def fetch_wms_tile(minx, miny, maxx, maxy, width, height, layer='mapant'):
                 print(f"WMS error: {response.text[:500]}")
                 return None
 
-            return Image.open(io.BytesIO(response.content))
+            return response.content
 
         except requests.RequestException as e:
             if attempt + 1 < WMS_RETRIES:
                 time.sleep(retry_delay(None, attempt))
                 continue
             print(f"Failed to fetch tile: {e}")
-            return None
-        except Exception as e:
-            print(f"Error processing tile: {e}")
             return None
 
     return None
